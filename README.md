@@ -108,34 +108,37 @@ def feedback_func(prompts, completions, **kwargs) -> list[str]:
 
 ### TRL version compatibility
 
-The trainer accesses several TRL-internal methods (`_generate`, `_calculate_rewards`, `_get_per_token_logps_and_entropies`). Compatibility guards are in place for the most likely breaking changes:
+`erl-trainer 0.2.x` targets **TRL 0.17.x** exclusively.
 
-- `_generate` return values are accessed by index rather than by position destructuring, so additions to TRL's return tuple are silently ignored.
-- `_get_per_token_logps_and_entropies` output is handled whether TRL returns a `(logps, entropies)` tuple or a dict.
-- The input batch is normalised at entry so both `dict[str, list]` (standard PyTorch DataLoader collate) and `list[dict]` (TRL's collator) are accepted.
+In TRL 0.17.0 the monolithic `_generate_and_score_completions` method handles everything — tokenisation, generation, EOS masking, log-probability computation, reward evaluation, advantage normalisation, and metrics logging — and returns a plain dict consumed by `_compute_loss`. There is no separate `_generate`, `_calculate_rewards`, or `_get_per_token_logps_and_entropies`.
 
-Tested against `trl>=0.15.0`. Pin your TRL version in production.
+`ERLTrainer` overrides `_generate_and_score_completions` and delegates Phase 1 (first attempt) entirely to the parent. ERL phases 2–7 run on top of the parent's output. The returned dict has the same keys as the parent's method so `_compute_loss` works without modification.
 
 ### Batched reflection and retry generation
 
 Reflections and retries for all gated samples in a batch are generated in two batched `model.generate` calls (one for all reflections, one for all retries), not one call per sample. This keeps GPU utilisation high regardless of how many samples are gated.
 
+### Advantage update
+
+Because TRL 0.17.0's `_compute_loss` reads advantages directly from the returned dict, ERL injects its corrected advantages at the dict level before returning:
+
+- **Non-gated samples** keep their y1 reward in the advantage computation.
+- **Gated samples** have their reward replaced with the y2 reward (the second-attempt score).
+
+The combined reward tensor is then group-normalised using the same formula as the parent, so the advantage scale is consistent across the batch.
+
 ### Algorithm 1 vs Algorithm 2
 
-This implementation follows **Algorithm 1** (simplified) from the paper: `y1`, `Δ`, and `y2` are packed into one combined batch and updated in a single GRPO pass with global advantage normalisation.
+This implementation follows **Algorithm 1** (simplified) from the paper: advantages are derived from a combined reward tensor (y1 rewards for non-gated, y2 rewards for gated) and the GRPO update runs once over the y1 completions with those corrected advantages.
 
-The paper's Appendix A describes **Algorithm 2** (full), which runs two separate RL updates — one on `y1` alone, then one on `Δ + y2` — giving per-group advantage normalisation for each update. The directional gradients are the same; only the advantage scale differs. Algorithm 2 can be implemented by splitting the packed batch and calling `compute_loss` twice.
+The paper's Appendix A describes **Algorithm 2** (full), which runs two separate RL updates — one on `y1` alone, then one on `Δ + y2`. Algorithm 2 can be approximated by calling `compute_loss` twice with different inputs.
 
 ### Compatibility
 
 | erl-trainer | TRL | transformers |
 |-------------|-----|--------------|
+| 0.2.x | 0.17.x | ≥ 4.50.0 |
 | 0.1.x | 0.15.x | ≥ 4.50.0 |
-
-`erl-trainer` accesses several TRL-internal methods (`_generate`, `_calculate_rewards`, `_get_per_token_logps_and_entropies`). Two runtime guards protect against breaking changes:
-
-- **`_unpack_generate`** — extracts prompt IDs, completion IDs, and completion texts from `_generate`'s return value using *type-based detection* rather than positional indices, so additions or reordering in TRL's return signature are silently tolerated.
-- **`_discover_batch_keys`** — on the first training step, pattern-matches the packed batch dict to confirm the key names that `_compute_loss` expects. If TRL renames a key (e.g. `prompt_ids` → `prompt_input_ids`), a warning is emitted and the correct name is used automatically.
 
 When a new TRL minor version is released, we verify compatibility and update the version constraint.
 

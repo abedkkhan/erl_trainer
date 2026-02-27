@@ -1,13 +1,10 @@
-"""Tests for ERLTrainer — instantiation, prompt helpers, and the two fragility fixes."""
-
-import warnings
+"""Tests for ERLTrainer — instantiation, prompt helpers, and ERL-specific helpers."""
 
 import pytest
 import torch
 
 from erl import ERLConfig, ERLTrainer
 from erl.memory import ReflectionMemory
-from erl.trainer import _BATCH_KEY_DEFAULTS
 
 
 TINY_MODEL = "sshleifer/tiny-gpt2"
@@ -112,28 +109,27 @@ def test_erl_trainer_has_expected_methods(erl_config):
         for method in [
             "_build_reflection_prompt",
             "_build_retry_prompt",
-            "_generate_erl_completions_batched",
-            "_pack_batch",
+            "_erl_generate",
+            "_erl_compute_rewards",
+            "_erl_compute_feedback",
+            "_generate_and_score_completions",
             "_compute_internalization_loss",
             "compute_loss",
-            "_prepare_inputs",
-            "_generate_and_score_completions",
-            "_unpack_generate",
-            "_discover_batch_keys",
         ]:
             assert hasattr(trainer, method), f"Missing method: {method}"
     except Exception:
         pytest.skip("Model not available in this environment.")
 
 
-def test_erl_trainer_batch_keys_initialised_to_none(erl_config):
+def test_erl_trainer_internalization_pairs_init(erl_config):
     try:
         trainer = ERLTrainer(
             model=TINY_MODEL,
             reward_funcs=_dummy_reward_func,
             args=erl_config,
         )
-        assert trainer._batch_keys is None
+        assert isinstance(trainer._internalization_pairs, list)
+        assert len(trainer._internalization_pairs) == 0
     except Exception:
         pytest.skip("Model not available in this environment.")
 
@@ -199,185 +195,61 @@ def test_build_reflection_prompt_no_memory(erl_config):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Issue 1 fix: _unpack_generate
+# _erl_compute_feedback
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _make_int_tensor_list(n: int, length: int = 5) -> list[torch.Tensor]:
-    return [torch.randint(0, 100, (length,)) for _ in range(n)]
+def test_erl_compute_feedback_returns_empty_strings_without_func(erl_config):
+    class _Stub(ERLTrainer):
+        def __init__(self):
+            self.args = erl_config
+            self.feedback_func = None
 
-
-def test_unpack_generate_extracts_first_two_int_tensor_lists_and_string_list():
-    prompt_ids = _make_int_tensor_list(4)
-    completion_ids = _make_int_tensor_list(4)
-    tool_mask = _make_int_tensor_list(4)
-    completions = ["hello", "world", "foo", "bar"]
-    extra_float = [torch.randn(5) for _ in range(4)]
-    extra_int = 42
-
-    result = (prompt_ids, completion_ids, tool_mask, completions, extra_float, extra_int)
-
-    p, c, texts = ERLTrainer._unpack_generate(result)
-
-    assert p is prompt_ids
-    assert c is completion_ids
-    assert texts is completions
-
-
-def test_unpack_generate_minimal_tuple():
-    prompt_ids = _make_int_tensor_list(2)
-    completion_ids = _make_int_tensor_list(2)
-    completions = ["a", "b"]
-
-    p, c, texts = ERLTrainer._unpack_generate((prompt_ids, completion_ids, completions))
-
-    assert p is prompt_ids
-    assert c is completion_ids
-    assert texts is completions
-
-
-def test_unpack_generate_with_2d_tensors():
-    prompt_ids_2d = torch.randint(0, 100, (4, 10))
-    completion_ids_2d = torch.randint(0, 100, (4, 8))
-    completions = ["a", "b", "c", "d"]
-
-    p, c, texts = ERLTrainer._unpack_generate((prompt_ids_2d, completion_ids_2d, completions))
-
-    assert p is prompt_ids_2d
-    assert c is completion_ids_2d
-    assert texts is completions
-
-
-def test_unpack_generate_ignores_float_tensors():
-    prompt_ids = _make_int_tensor_list(2)
-    completion_ids = _make_int_tensor_list(2)
-    logprobs = [torch.randn(5) for _ in range(2)]
-    completions = ["hello", "world"]
-
-    p, c, texts = ERLTrainer._unpack_generate(
-        (logprobs, prompt_ids, completion_ids, completions)
+    stub = _Stub()
+    result = stub._erl_compute_feedback(
+        [{"prompt": "p", "answer": 4}], ["p"], ["c"]
     )
-
-    assert p is prompt_ids
-    assert c is completion_ids
+    assert result == [""]
 
 
-def test_unpack_generate_flattens_nested_string_list():
-    prompt_ids = _make_int_tensor_list(2)
-    completion_ids = _make_int_tensor_list(2)
-    nested = [["hello", "world"], ["foo", "bar"]]
+def test_erl_compute_feedback_calls_func_with_extra_kwargs(erl_config):
+    class _Stub(ERLTrainer):
+        def __init__(self):
+            self.args = erl_config
+            self.feedback_func = (
+                lambda prompts, completions, answer, **kw: [
+                    f"answer={a}" for a in answer
+                ]
+            )
 
-    p, c, texts = ERLTrainer._unpack_generate((prompt_ids, completion_ids, nested))
-
-    assert texts == ["hello", "world", "foo", "bar"]
-
-
-def test_unpack_generate_raises_on_too_few_token_batches():
-    completions = ["hello", "world"]
-    only_one = _make_int_tensor_list(2)
-
-    with pytest.raises(ValueError, match="fewer than 2 token ID batches"):
-        ERLTrainer._unpack_generate((only_one, completions))
-
-
-def test_unpack_generate_raises_on_missing_string_list():
-    prompt_ids = _make_int_tensor_list(2)
-    completion_ids = _make_int_tensor_list(2)
-
-    with pytest.raises(ValueError, match="no list of strings"):
-        ERLTrainer._unpack_generate((prompt_ids, completion_ids, 42))
-
-
-def test_unpack_generate_handles_namedtuple():
-    from collections import namedtuple
-
-    GenerateResult = namedtuple(
-        "GenerateResult",
-        ["prompt_ids", "completion_ids", "tool_mask", "completions", "count"],
+    stub = _Stub()
+    result = stub._erl_compute_feedback(
+        [{"prompt": "p", "answer": 7}],
+        ["p"],
+        ["c"],
     )
-    prompt_ids = _make_int_tensor_list(2)
-    completion_ids = _make_int_tensor_list(2)
-    completions = ["a", "b"]
-
-    result = GenerateResult(
-        prompt_ids=prompt_ids,
-        completion_ids=completion_ids,
-        tool_mask=None,
-        completions=completions,
-        count=2,
-    )
-
-    p, c, texts = ERLTrainer._unpack_generate(result)
-    assert p is prompt_ids
-    assert c is completion_ids
-    assert texts is completions
+    assert result == ["answer=7"]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Issue 2 fix: _discover_batch_keys
-# ──────────────────────────────────────────────────────────────────────────────
+def test_erl_compute_feedback_multiple_samples(erl_config):
+    feedbacks = ["fb-a", "fb-b", "fb-c"]
+    call_args: dict = {}
 
-def test_discover_batch_keys_standard_trl_names():
-    reference = {
-        "prompt_ids": torch.zeros(2, 5, dtype=torch.long),
-        "prompt_mask": torch.ones(2, 5, dtype=torch.long),
-        "completion_ids": torch.zeros(2, 8, dtype=torch.long),
-        "completion_mask": torch.ones(2, 8, dtype=torch.long),
-        "advantages": torch.randn(2),
-    }
+    def feedback_func(prompts, completions, **kwargs):
+        call_args["prompts"] = prompts
+        call_args["completions"] = completions
+        return feedbacks
 
-    keys = ERLTrainer._discover_batch_keys(reference)
+    class _Stub(ERLTrainer):
+        def __init__(self):
+            self.args = erl_config
+            self.feedback_func = feedback_func
 
-    assert keys["prompt_ids"] == "prompt_ids"
-    assert keys["prompt_mask"] == "prompt_mask"
-    assert keys["completion_ids"] == "completion_ids"
-    assert keys["completion_mask"] == "completion_mask"
+    stub = _Stub()
+    inputs = [{"prompt": f"p{i}"} for i in range(3)]
+    prompts = [f"p{i}" for i in range(3)]
+    completions = [f"c{i}" for i in range(3)]
 
-
-def test_discover_batch_keys_renamed_trl_keys():
-    reference = {
-        "prompt_input_ids": torch.zeros(2, 5, dtype=torch.long),
-        "prompt_attention_mask": torch.ones(2, 5, dtype=torch.long),
-        "completion_input_ids": torch.zeros(2, 8, dtype=torch.long),
-        "completion_attention_mask": torch.ones(2, 8, dtype=torch.long),
-    }
-
-    keys = ERLTrainer._discover_batch_keys(reference)
-
-    assert keys["prompt_ids"] == "prompt_input_ids"
-    assert keys["prompt_mask"] == "prompt_attention_mask"
-    assert keys["completion_ids"] == "completion_input_ids"
-    assert keys["completion_mask"] == "completion_attention_mask"
-
-
-def test_discover_batch_keys_partial_match_falls_back_with_warning():
-    reference = {
-        "something_unknown": torch.zeros(2, 5),
-        "another_weird_key": torch.ones(2, 8),
-    }
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        keys = ERLTrainer._discover_batch_keys(reference)
-
-    assert any("Could not auto-discover" in str(w.message) for w in caught)
-    assert keys == _BATCH_KEY_DEFAULTS
-
-
-def test_discover_batch_keys_empty_dict_falls_back_with_warning():
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        keys = ERLTrainer._discover_batch_keys({})
-
-    assert any("Could not auto-discover" in str(w.message) for w in caught)
-    assert keys == _BATCH_KEY_DEFAULTS
-
-
-def test_discover_batch_keys_returns_defaults_shape():
-    reference = {
-        "prompt_ids": None,
-        "prompt_mask": None,
-        "completion_ids": None,
-        "completion_mask": None,
-    }
-    keys = ERLTrainer._discover_batch_keys(reference)
-    assert set(keys.keys()) == {"prompt_ids", "prompt_mask", "completion_ids", "completion_mask"}
+    result = stub._erl_compute_feedback(inputs, prompts, completions)
+    assert result == feedbacks
+    assert call_args["prompts"] == prompts
+    assert call_args["completions"] == completions
