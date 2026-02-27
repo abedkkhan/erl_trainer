@@ -11,28 +11,66 @@ from erl.config import ERLConfig
 from erl.memory import ReflectionMemory
 
 
+def _to_list_of_dicts(inputs: list[dict] | dict[str, Any]) -> list[dict]:
+    """Normalise the two formats TRL may pass to _generate_and_score_completions.
+
+    TRL's DataLoader can deliver either a dict-of-lists (standard PyTorch collate)
+    or a list-of-dicts (TRL's own collator in some versions).  Both are converted
+    to a canonical list-of-dicts before any processing.
+    """
+    if isinstance(inputs, list):
+        return inputs
+    keys = list(inputs.keys())
+    if not keys:
+        return []
+    n = len(inputs[keys[0]])
+    return [{k: inputs[k][i] for k in keys} for i in range(n)]
+
+
+def _extract_logps(result: Any) -> torch.Tensor:
+    """Safely extract per-token log-probabilities from _get_per_token_logps_and_entropies.
+
+    Different TRL versions return either a 2-tuple ``(logps, entropies)`` or a
+    dict with a ``"logps"`` / ``"per_token_logps"`` key.  Both are handled here.
+    """
+    if isinstance(result, tuple):
+        return result[0]
+    if isinstance(result, dict):
+        for key in ("logps", "per_token_logps"):
+            if key in result:
+                return result[key]
+        raise KeyError(f"Cannot find logps in result dict with keys: {list(result.keys())}")
+    return result
+
+
 class ERLTrainer(GRPOTrainer):
     """Experiential Reinforcement Learning trainer extending TRL's GRPOTrainer.
 
-    Implements the ERL algorithm which adds an experience-reflection-consolidation loop
-    on top of standard GRPO. The loop consists of:
+    Implements Algorithm 1 (simplified combined update) from the ERL paper.
+    All three output types — first attempt (y1), reflection (Δ), and second
+    attempt (y2) — are combined into one batch and updated jointly.
 
-    1. First attempt (y1) with reward r1 and textual feedback f1.
-    2. Gating: samples where r1 < reward_threshold enter the reflection loop.
-    3. Self-reflection: the model reflects on its failure using f1 and memory.
-    4. Second attempt (y2) guided by the reflection, with reward r2.
-    5. Memory: successful reflections (r2 > threshold) are stored for future use.
-    6. RL update (GRPO) on the combined batch: y1, reflections, and y2.
-    7. Internalization: SFT on (prompt → y2) for successful second attempts (r2 > 0).
+    Note on Algorithm 1 vs Algorithm 2:
+        The paper's Appendix A describes Algorithm 2 (full), which separates the
+        RL update into two steps: one on y1 alone (line 9), then one on Δ + y2
+        together (line 21).  Algorithm 1 (implemented here) combines all three
+        into a single GRPO update.  The practical difference is in advantage
+        normalisation: per-group normalisation over separate batches vs. global
+        normalisation over the mixed batch.  The directional gradients are the
+        same; only the magnitude scaling differs.  Algorithm 2 can be implemented
+        by splitting the batch and calling super().compute_loss twice.
 
     Args:
         model: Model to train (same as GRPOTrainer).
         reward_funcs: Reward function(s) (same as GRPOTrainer).
         args: ERLConfig instance with ERL-specific hyperparameters.
-        feedback_func: Callable that takes completions (and optionally prompts) and
-            returns a list of textual feedback strings. Signature mirrors reward_funcs:
-            ``feedback_func(prompts=..., completions=..., **kwargs) -> list[str]``.
-        **kwargs: All remaining keyword arguments are forwarded to GRPOTrainer.
+        feedback_func: Callable that receives the same kwargs as a reward function
+            and returns a list of textual feedback strings — one per completion.
+            Signature: ``feedback_func(prompts=..., completions=..., **kwargs) -> list[str]``.
+            May be ``None``; in that case empty strings are used as feedback (the
+            reflection prompt will have blank feedback, which degrades quality but
+            does not break training).
+        **kwargs: Forwarded verbatim to GRPOTrainer.__init__.
     """
 
     def __init__(
@@ -84,45 +122,64 @@ class ERLTrainer(GRPOTrainer):
         )
 
     # ------------------------------------------------------------------
-    # Single-completion generation for ERL reflection / retry phases
+    # Batched generation for reflection / retry phases
     # ------------------------------------------------------------------
 
-    def _generate_erl_completion(
-        self, prompt_text: str
-    ) -> tuple[torch.Tensor, torch.Tensor, str]:
-        """Generate exactly one completion for ERL reflection or retry phases.
+    def _generate_erl_completions_batched(
+        self, prompt_texts: list[str]
+    ) -> list[tuple[torch.Tensor, torch.Tensor, str]]:
+        """Generate one completion per prompt for ERL phases, in a single batched call.
 
-        Uses the model's chat template to format the prompt and calls ``model.generate``
-        with ``torch.no_grad()`` using the same temperature / length settings as the
-        main GRPO generation.
+        Prompts are formatted as single-turn user messages, left-padded for
+        generation, then sliced apart after the forward pass so that each result
+        carries its own (unpadded) prompt token IDs.  This replaces the previous
+        sequential loop and reduces generation calls from ``2 × num_gated`` to 2.
 
         Args:
-            prompt_text: Plain-text content for the user turn.
+            prompt_texts: Plain-text content for each user turn.
 
         Returns:
-            Tuple of (prompt_ids, completion_ids, completion_text), all on CPU.
+            List of ``(prompt_ids, completion_ids, completion_text)`` tuples, all
+            on CPU, in the same order as ``prompt_texts``.
         """
-        messages = [{"role": "user", "content": prompt_text}]
+        if not prompt_texts:
+            return []
+
         tokenizer = self.processing_class
+        device = self.accelerator.device
+        pad_token_id: int = tokenizer.pad_token_id or tokenizer.eos_token_id
 
-        input_ids: torch.Tensor = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_tensors="pt",
-            add_generation_prompt=True,
-        ).to(self.accelerator.device)
+        formatted_texts: list[str] = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for text in prompt_texts
+        ]
 
-        prompt_len = input_ids.shape[1]
-        attention_mask = torch.ones_like(input_ids)
+        original_padding_side = getattr(tokenizer, "padding_side", "right")
+        tokenizer.padding_side = "left"
+        try:
+            encoded = tokenizer(
+                formatted_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
+        finally:
+            tokenizer.padding_side = original_padding_side
 
-        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+        input_ids: torch.Tensor = encoded["input_ids"].to(device)
+        attention_mask: torch.Tensor = encoded["attention_mask"].to(device)
+        padded_prompt_len: int = input_ids.shape[1]
 
         unwrapped = self.accelerator.unwrap_model(self.model)
         was_training = unwrapped.training
         try:
             unwrapped.eval()
             with torch.no_grad():
-                output_ids = unwrapped.generate(
+                output_ids: torch.Tensor = unwrapped.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=self.args.max_completion_length,
@@ -135,9 +192,16 @@ class ERLTrainer(GRPOTrainer):
             if was_training:
                 unwrapped.train()
 
-        completion_ids = output_ids[0, prompt_len:].cpu()
-        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-        return input_ids[0].cpu(), completion_ids, completion_text
+        results: list[tuple[torch.Tensor, torch.Tensor, str]] = []
+        for i in range(len(prompt_texts)):
+            actual_prompt_len = int(attention_mask[i].sum().item())
+            actual_prompt_ids = input_ids[i, -actual_prompt_len:].cpu()
+
+            completion_ids = output_ids[i, padded_prompt_len:].cpu()
+            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+            results.append((actual_prompt_ids, completion_ids, completion_text))
+
+        return results
 
     # ------------------------------------------------------------------
     # Batch packing: token lists → padded tensors + advantages + logprobs
@@ -151,18 +215,23 @@ class ERLTrainer(GRPOTrainer):
     ) -> dict[str, torch.Tensor | int]:
         """Pack variable-length sequence tensors into a padded batch dict.
 
-        Pads prompts on the left and completions on the right, computes global
-        advantage normalisation over all sequences in the batch (appropriate for
-        ERL's mixed batch of y1, reflections, and y2), and computes per-token
-        log-probabilities under the current model weights (needed for PPO clipping).
+        Prompts are left-padded; completions are right-padded.  Advantages are
+        computed by global mean/std normalisation across the entire mixed batch
+        (y1 + reflections + y2), which is appropriate because the prompts are
+        heterogeneous and GRPO's per-group normalisation does not apply.
+
+        The returned dict keys match exactly what GRPOTrainer._compute_loss expects:
+        ``prompt_ids``, ``prompt_mask``, ``completion_ids``, ``completion_mask``,
+        ``advantages``, ``old_per_token_logps``, ``num_items_in_batch``, and
+        optionally ``ref_per_token_logps``.
 
         Args:
-            prompt_ids_list: List of 1-D prompt token ID tensors (CPU).
-            completion_ids_list: List of 1-D completion token ID tensors (CPU).
+            prompt_ids_list: List of 1-D CPU prompt token ID tensors.
+            completion_ids_list: List of 1-D CPU completion token ID tensors.
             rewards: Scalar reward for each sequence.
 
         Returns:
-            Dict with keys expected by GRPOTrainer's ``_compute_loss``.
+            Dict consumed directly by ``_compute_loss``.
         """
         device = self.accelerator.device
         pad_id: int = self.processing_class.pad_token_id or 0
@@ -196,15 +265,17 @@ class ERLTrainer(GRPOTrainer):
         std = rewards_t.std()
         advantages = (rewards_t - rewards_t.mean()) / (std + 1e-4)
 
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        input_ids_full = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask_full = torch.cat([prompt_mask, completion_mask], dim=1)
 
         with torch.no_grad():
-            old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                self.model,
-                input_ids,
-                attention_mask,
-                max_completion_len,
+            old_per_token_logps = _extract_logps(
+                self._get_per_token_logps_and_entropies(
+                    self.model,
+                    input_ids_full,
+                    attention_mask_full,
+                    max_completion_len,
+                )
             )
 
         result: dict[str, Any] = {
@@ -219,58 +290,60 @@ class ERLTrainer(GRPOTrainer):
 
         if self.ref_model is not None:
             with torch.no_grad():
-                ref_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.ref_model,
-                    input_ids,
-                    attention_mask,
-                    max_completion_len,
+                result["ref_per_token_logps"] = _extract_logps(
+                    self._get_per_token_logps_and_entropies(
+                        self.ref_model,
+                        input_ids_full,
+                        attention_mask_full,
+                        max_completion_len,
+                    )
                 )
-            result["ref_per_token_logps"] = ref_logps
 
         return result
 
     # ------------------------------------------------------------------
-    # Core ERL training loop (overrides _prepare_inputs / generation)
+    # Core ERL training loop
     # ------------------------------------------------------------------
 
     def _prepare_inputs(
-        self, generation_batch: dict[str, Any]
+        self, generation_batch: list[dict] | dict[str, Any]
     ) -> dict[str, torch.Tensor | Any]:
         """Override to run ERL generation every step without buffering.
 
-        ERL's combined batch size varies per step (depends on how many samples are
-        gated), making TRL's fixed-size buffer slicing incompatible. Regenerating
-        each step is simpler and ensures correctness.
+        ERL's combined batch size varies per step (depends on how many samples
+        are gated), making TRL's fixed-size buffer slicing incompatible.
+        Regenerating each step is simpler and ensures correctness.
         """
         return self._generate_and_score_completions(generation_batch)
 
     def _generate_and_score_completions(
-        self, inputs: list[dict[str, Any]]
+        self, inputs: list[dict[str, Any]] | dict[str, Any]
     ) -> dict[str, torch.Tensor | Any]:
         """Run the full ERL loop for one training batch.
 
-        Phases 1-7 of the ERL algorithm are executed here. The returned dict is
-        consumed directly by GRPOTrainer's ``_compute_loss``.
+        Implements Algorithm 1 (combined RL update) from the paper.  All seven
+        ERL phases execute here; the result is consumed directly by
+        GRPOTrainer._compute_loss.
+
+        Input normalisation:
+            TRL may pass either a dict-of-lists (standard PyTorch DataLoader
+            collate) or a list-of-dicts (TRL's own collator).  Both are accepted.
 
         Args:
-            inputs: List of dataset row dicts, each with at least a ``"prompt"`` key.
+            inputs: Dataset rows for the current batch.
 
         Returns:
-            Batch dict with padded tensors, advantages, and logprobs for all
+            Batch dict with padded tensors, advantages, and logprobs covering all
             generated sequences (y1, reflections, y2).
         """
+        inputs = _to_list_of_dicts(inputs)
         prompts = [x["prompt"] for x in inputs]
 
         # ── Phase 1: First attempt ────────────────────────────────────────
-        (
-            prompt_ids_y1,
-            completion_ids_y1,
-            _tool_mask,
-            completions_y1,
-            _num_items,
-            _logps,
-            _extra,
-        ) = self._generate(prompts)
+        _generate_result = self._generate(prompts)
+        prompt_ids_y1: list = _generate_result[0]
+        completion_ids_y1: list = _generate_result[1]
+        completions_y1: list[str] = _generate_result[3]
 
         rewards_y1_per_func = self._calculate_rewards(
             inputs, prompts, completions_y1, completion_ids_y1
@@ -286,73 +359,97 @@ class ERLTrainer(GRPOTrainer):
 
         # ── Phase 2: Gating ───────────────────────────────────────────────
         gated_mask: list[bool] = (r1 < self.args.reward_threshold).tolist()
+        gated_indices: list[int] = [i for i, g in enumerate(gated_mask) if g]
 
-        all_prompt_ids: list[torch.Tensor] = [
-            p.cpu() if isinstance(p, torch.Tensor) else torch.tensor(p)
-            for p in prompt_ids_y1
-        ]
-        all_completion_ids: list[torch.Tensor] = [
-            c.cpu() if isinstance(c, torch.Tensor) else torch.tensor(c)
-            for c in completion_ids_y1
-        ]
+        # Normalise prompt_ids / completion_ids to CPU tensors
+        def _to_cpu_tensor(t: Any) -> torch.Tensor:
+            if isinstance(t, torch.Tensor):
+                return t.cpu()
+            return torch.tensor(t, dtype=torch.long)
+
+        all_prompt_ids: list[torch.Tensor] = [_to_cpu_tensor(p) for p in prompt_ids_y1]
+        all_completion_ids: list[torch.Tensor] = [_to_cpu_tensor(c) for c in completion_ids_y1]
         all_rewards: list[float] = r1.cpu().tolist()
 
         internalization_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
 
-        # ── Phases 3-5: Reflection, retry, and memory (gated samples) ────
-        for i, is_gated in enumerate(gated_mask):
-            if not is_gated:
-                continue
+        if gated_indices:
+            # ── Phase 3: Self-reflection (batched) ───────────────────────
+            reflection_contents: list[str] = []
+            for i in gated_indices:
+                prompt_idx = i // self.num_generations
+                original_prompt = str(prompts[prompt_idx])
 
-            prompt_idx = i // self.num_generations
-            original_prompt = str(prompts[prompt_idx])
+                memory_entries: list[str] = []
+                if self.args.enable_memory and self.memory is not None:
+                    memory_entries = self.memory.retrieve(
+                        original_prompt, self.args.memory_top_k
+                    )
 
-            memory_entries: list[str] = []
-            if self.args.enable_memory and self.memory is not None:
-                memory_entries = self.memory.retrieve(original_prompt, self.args.memory_top_k)
+                reflection_contents.append(
+                    self._build_reflection_prompt(
+                        prompt=original_prompt,
+                        attempt=completions_y1[i],
+                        feedback=f1[i],
+                        reward=float(r1[i].item()),
+                        memory_entries=memory_entries,
+                    )
+                )
 
-            reflection_content = self._build_reflection_prompt(
-                prompt=original_prompt,
-                attempt=completions_y1[i],
-                feedback=f1[i],
-                reward=float(r1[i].item()),
-                memory_entries=memory_entries,
-            )
+            reflection_results = self._generate_erl_completions_batched(reflection_contents)
 
-            rfl_prompt_ids, delta_ids, delta_text = self._generate_erl_completion(
-                reflection_content
-            )
+            # ── Phase 4: Second attempt (batched) ─────────────────────────
+            retry_contents: list[str] = []
+            for idx, i in enumerate(gated_indices):
+                prompt_idx = i // self.num_generations
+                original_prompt = str(prompts[prompt_idx])
+                _, _, delta_text = reflection_results[idx]
+                retry_contents.append(
+                    self._build_retry_prompt(prompt=original_prompt, reflection=delta_text)
+                )
 
-            retry_content = self._build_retry_prompt(
-                prompt=original_prompt, reflection=delta_text
-            )
+            retry_results = self._generate_erl_completions_batched(retry_contents)
 
-            retry_prompt_ids, y2_ids, y2_text = self._generate_erl_completion(retry_content)
+            # ── Phases 5 + build combined batch ──────────────────────────
+            for batch_pos, i in enumerate(gated_indices):
+                prompt_idx = i // self.num_generations
+                original_prompt = str(prompts[prompt_idx])
 
-            rewards_y2_per_func = self._calculate_rewards(
-                [inputs[prompt_idx]],
-                [prompts[prompt_idx]],
-                [y2_text],
-                [y2_ids.tolist()],
-            )
-            r2: float = (
-                rewards_y2_per_func * self.reward_weights.to(rewards_y2_per_func.device)
-            ).nansum(dim=1).item()
+                rfl_prompt_ids, delta_ids, delta_text = reflection_results[batch_pos]
+                retry_prompt_ids, y2_ids, y2_text = retry_results[batch_pos]
 
-            if self.args.enable_memory and self.memory is not None and r2 > self.args.reward_threshold:
-                self.memory.add(delta_text, original_prompt, r2)
+                rewards_y2_per_func = self._calculate_rewards(
+                    [inputs[prompt_idx]],
+                    [prompts[prompt_idx]],
+                    [y2_text],
+                    [y2_ids],
+                )
+                r2: float = (
+                    rewards_y2_per_func
+                    * self.reward_weights.to(rewards_y2_per_func.device)
+                ).nansum(dim=1).item()
 
-            all_prompt_ids.append(rfl_prompt_ids)
-            all_completion_ids.append(delta_ids)
-            all_rewards.append(r2)
+                # Phase 5: Memory update
+                if (
+                    self.args.enable_memory
+                    and self.memory is not None
+                    and r2 > self.args.reward_threshold
+                ):
+                    self.memory.add(delta_text, original_prompt, r2)
 
-            all_prompt_ids.append(retry_prompt_ids)
-            all_completion_ids.append(y2_ids)
-            all_rewards.append(r2)
+                # Reflection enters the combined batch with reward r2
+                all_prompt_ids.append(rfl_prompt_ids)
+                all_completion_ids.append(delta_ids)
+                all_rewards.append(r2)
 
-            if r2 > 0 and self.args.enable_internalization:
-                original_prompt_ids = all_prompt_ids[i]
-                internalization_pairs.append((original_prompt_ids, y2_ids))
+                # y2 enters the combined batch with reward r2
+                all_prompt_ids.append(retry_prompt_ids)
+                all_completion_ids.append(y2_ids)
+                all_rewards.append(r2)
+
+                # Phase 7 data: (original prompt, y2) for internalization
+                if r2 > 0 and self.args.enable_internalization:
+                    internalization_pairs.append((_to_cpu_tensor(prompt_ids_y1[i]), y2_ids))
 
         self._erl_internalization_data = internalization_pairs or None
 
@@ -366,12 +463,13 @@ class ERLTrainer(GRPOTrainer):
     def _compute_internalization_loss(self, model: nn.Module) -> torch.Tensor:
         """Compute cross-entropy SFT loss for internalizing y2 without reflection context.
 
-        Trains the model to predict successful second-attempt completions directly from
-        the original prompt, so the improved behaviour persists at inference time when
-        no reflection scaffold is present.
+        Trains the model on ``(original_prompt → y2)`` pairs so that improved
+        behaviour is preserved at deployment time when no reflection scaffold is
+        present.  Labels for prompt tokens are set to ``-100`` (ignored by
+        cross-entropy).
 
         Args:
-            model: The current training model (may be wrapped by Accelerate).
+            model: The current training model (may be Accelerate-wrapped).
 
         Returns:
             Scalar cross-entropy loss tensor.
@@ -390,11 +488,10 @@ class ERLTrainer(GRPOTrainer):
         for prompt_ids, y2_ids in pairs:
             p = prompt_ids.tolist()
             c = y2_ids.tolist()
-            seq_len = len(p) + len(c)
 
             all_input_ids.append(torch.tensor(p + c, dtype=torch.long))
             all_labels.append(torch.tensor([-100] * len(p) + c, dtype=torch.long))
-            all_attention_masks.append(torch.ones(seq_len, dtype=torch.long))
+            all_attention_masks.append(torch.ones(len(p) + len(c), dtype=torch.long))
 
         max_len = max(t.shape[0] for t in all_input_ids)
 
@@ -422,11 +519,12 @@ class ERLTrainer(GRPOTrainer):
         return_outputs: bool = False,
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
-        """Compute GRPO loss plus optional internalization loss.
+        """Compute GRPO loss (Phase 6) plus optional internalization loss (Phase 7).
 
-        The GRPO loss is computed by the parent over the full combined batch
-        (y1, reflections, y2 with their respective rewards / advantages). The
-        internalization loss is cross-entropy on successful (prompt → y2) pairs.
+        The GRPO loss runs over the full combined batch produced by
+        ``_generate_and_score_completions`` (y1 with r1, reflections with r2,
+        y2 with r2).  The internalization loss is standard cross-entropy on
+        successful ``(prompt → y2)`` pairs.
 
         Args:
             model: Training model passed by the Trainer loop.
