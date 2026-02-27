@@ -138,6 +138,35 @@ config = ERLConfig(
 )
 ```
 
+## Citation
+
+If you use `erl-trainer` in your research, please cite the original ERL paper and TRL:
+
+**ERL paper** — the algorithm this package implements:
+
+```bibtex
+@article{shi2026erl,
+  title   = {Experiential Reinforcement Learning},
+  author  = {Shi, Taiwei and Chen, Sihao and Jiang, Bowen and Song, Linxin and Yang, Longqi and Zhao, Jieyu},
+  journal = {arXiv preprint arXiv:2602.13949},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2602.13949}
+}
+```
+
+**TRL** — the GRPO trainer this package extends:
+
+```bibtex
+@software{vonwerra2020trl,
+  title  = {{TRL: Transformers Reinforcement Learning}},
+  author = {von Werra, Leandro and Belkada, Younes and Tunstall, Lewis and
+            Beeching, Edward and Thrush, Tristan and Lambert, Nathan and
+            Huang, Shengyi and Rasul, Kashif and Gallouédec, Quentin},
+  url    = {https://github.com/huggingface/trl},
+  year   = {2020}
+}
+```
+
 ## License
 
 MIT
