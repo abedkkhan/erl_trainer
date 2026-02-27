@@ -126,6 +126,19 @@ This implementation follows **Algorithm 1** (simplified) from the paper: `y1`, `
 
 The paper's Appendix A describes **Algorithm 2** (full), which runs two separate RL updates — one on `y1` alone, then one on `Δ + y2` — giving per-group advantage normalisation for each update. The directional gradients are the same; only the advantage scale differs. Algorithm 2 can be implemented by splitting the packed batch and calling `compute_loss` twice.
 
+### Compatibility
+
+| erl-trainer | TRL | transformers |
+|-------------|-----|--------------|
+| 0.1.x | 0.15.x | ≥ 4.50.0 |
+
+`erl-trainer` accesses several TRL-internal methods (`_generate`, `_calculate_rewards`, `_get_per_token_logps_and_entropies`). Two runtime guards protect against breaking changes:
+
+- **`_unpack_generate`** — extracts prompt IDs, completion IDs, and completion texts from `_generate`'s return value using *type-based detection* rather than positional indices, so additions or reordering in TRL's return signature are silently tolerated.
+- **`_discover_batch_keys`** — on the first training step, pattern-matches the packed batch dict to confirm the key names that `_compute_loss` expects. If TRL renames a key (e.g. `prompt_ids` → `prompt_input_ids`), a warning is emitted and the correct name is used automatically.
+
+When a new TRL minor version is released, we verify compatibility and update the version constraint.
+
 ### Ablations
 
 Both memory and internalization can be disabled independently, which is useful for ablation studies:
