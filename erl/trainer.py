@@ -218,6 +218,33 @@ class ERLTrainer(GRPOTrainer):
         )
 
     # ------------------------------------------------------------------
+    # TRL version compatibility
+    # ------------------------------------------------------------------
+
+    def _erl_get_logps(
+        self,
+        model: nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Compatibility wrapper for TRL's per-token log-prob computation.
+
+        ``_get_per_token_logps_and_entropies`` was added mid-0.17 series.
+        Falls back to the older ``_get_per_token_logps`` when the newer
+        method is not present.
+        """
+        if hasattr(self, "_get_per_token_logps_and_entropies"):
+            return self._get_per_token_logps_and_entropies(
+                model, input_ids, attention_mask, logits_to_keep=logits_to_keep
+            )
+        # Older TRL (≤ 0.17.0 initial release)
+        logps = self._get_per_token_logps(
+            model, input_ids, attention_mask, logits_to_keep=logits_to_keep
+        )
+        return logps, None
+
+    # ------------------------------------------------------------------
     # Internal generation helper
     # ------------------------------------------------------------------
 
@@ -305,7 +332,7 @@ class ERLTrainer(GRPOTrainer):
 
         # ── Old policy log-probs ───────────────────────────────────────────────
         full_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+        old_per_token_logps, _ = self._erl_get_logps(
             self.model, prompt_completion_ids, full_mask, logits_to_keep=C
         )
 
@@ -313,7 +340,7 @@ class ERLTrainer(GRPOTrainer):
         ref_model = getattr(self, "ref_model", None)
         beta = getattr(self, "beta", 0.0)
         if ref_model is not None and beta != 0.0:
-            ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+            ref_per_token_logps, _ = self._erl_get_logps(
                 ref_model, prompt_completion_ids, full_mask, logits_to_keep=C
             )
         else:
@@ -541,7 +568,7 @@ class ERLTrainer(GRPOTrainer):
         input_ids      = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask.long()], dim=1)
 
-        per_token_logps, _ = self._get_per_token_logps_and_entropies(
+        per_token_logps, _ = self._erl_get_logps(
             model, input_ids, attention_mask, logits_to_keep=C
         )
 
