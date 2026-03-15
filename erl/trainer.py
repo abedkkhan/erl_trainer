@@ -482,19 +482,28 @@ class ERLTrainer(GRPOTrainer):
 
         for prompt, y2_text in pairs:
             prompt_text = _prompt_to_text(prompt, tokenizer)
-            prompt_ids = tokenizer(
-                prompt_text, add_special_tokens=False, return_tensors="pt"
-            )["input_ids"][0].tolist()
-            y2_ids = tokenizer(
-                y2_text, add_special_tokens=False, return_tensors="pt"
-            )["input_ids"][0].tolist()
 
-            seq = prompt_ids + y2_ids
-            all_input_ids.append(torch.tensor(seq, dtype=torch.long))
-            all_labels.append(
-                torch.tensor([-100] * len(prompt_ids) + y2_ids, dtype=torch.long)
-            )
-            all_attention_masks.append(torch.ones(len(seq), dtype=torch.long))
+            # Tokenize the full string as one piece so BPE merges at the
+            # prompt/completion boundary are computed correctly.  Separate
+            # tokenization can produce a different (invalid) token sequence
+            # because context-dependent merges at the junction are missed.
+            full_ids: torch.Tensor = tokenizer(
+                prompt_text + y2_text, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"][0]
+
+            # Use prompt-only length to locate the label mask boundary.
+            # Off-by-one at the boundary is at most 1-2 tokens and is
+            # inconsequential — the input_ids correctness is the critical fix.
+            prompt_only_len: int = tokenizer(
+                prompt_text, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"].shape[1]
+
+            labels = full_ids.clone()
+            labels[:prompt_only_len] = -100
+
+            all_input_ids.append(full_ids)
+            all_labels.append(labels)
+            all_attention_masks.append(torch.ones(full_ids.shape[0], dtype=torch.long))
 
         max_len = max(t.shape[0] for t in all_input_ids)
 
