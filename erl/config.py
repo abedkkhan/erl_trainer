@@ -22,6 +22,12 @@ class ERLConfig(GRPOConfig):
         enable_internalization: Toggle the distillation step on/off.
         erl_rl_coef: Weight of the ERL RL loss on Δ and y2 relative to the y1 RL loss.
             Set to 0.0 to disable RL updates on reflections and second attempts (Algorithm 1 mode).
+
+    Note:
+        The reward function passed to ``ERLTrainer`` may return either
+        ``list[float]`` (GRPO-compatible) or ``list[tuple[float, str]]``
+        (score + feedback pairs for richer reflections).  No separate
+        ``feedback_func`` is needed.
     """
 
     reward_threshold: float = field(
