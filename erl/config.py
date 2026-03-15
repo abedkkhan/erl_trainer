@@ -81,3 +81,12 @@ class ERLConfig(GRPOConfig):
             )
         },
     )
+    debug: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable detailed per-step logging of every ERL phase. "
+                "Uses the 'erl' logger at DEBUG level."
+            )
+        },
+    )

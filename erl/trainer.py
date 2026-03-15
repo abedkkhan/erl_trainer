@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any, Callable
 
 import torch
@@ -36,6 +37,8 @@ try:
 except ImportError:  # pragma: no cover
     _apply_chat_template = None  # type: ignore[assignment]
 
+
+logger = logging.getLogger("erl")
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -177,6 +180,13 @@ class ERLTrainer(GRPOTrainer):
         )
         self._internalization_pairs: list[tuple[Any, str]] = []
         self._erl_rl_data: dict | None = None
+
+        if self.args.debug:
+            logger.setLevel(logging.DEBUG)
+            if not logger.handlers:
+                handler = logging.StreamHandler()
+                handler.setFormatter(logging.Formatter("%(message)s"))
+                logger.addHandler(handler)
 
     # ------------------------------------------------------------------
     # Prompt construction helpers
@@ -623,6 +633,10 @@ class ERLTrainer(GRPOTrainer):
         """Run the full ERL loop and return a batch dict for ``_compute_loss``."""
         inputs = _to_list_of_dicts(inputs)
 
+        _debug = self.args.debug
+        if _debug:
+            _step = self.state.global_step
+
         # Clear wrapper caches so stale data from the previous step cannot
         # leak into y1 reward/feedback reads for this step.
         for wrapper in self._reward_wrappers:
@@ -650,9 +664,27 @@ class ERLTrainer(GRPOTrainer):
             inputs_orig, prompts_raw, completions_y1
         )
 
+        if _debug:
+            n = len(y1_texts)
+            r_list = [round(r, 3) for r in y1_rewards.tolist()]
+            logger.debug(
+                f"[ERL Step {_step}] Phase 1 — First Attempt\n"
+                f"  Batch size: {n}\n"
+                f"  Y1 rewards: {r_list}\n"
+                f"  Y1 reward mean: {y1_rewards.mean().item():.3f}\n"
+                f"  Y1 sample (first): \"{y1_texts[0][:100]}...\""
+            )
+
         # ── Phase 2: Gating ─────────────────────────────────────────────────
         gated_mask = (y1_rewards < self.args.reward_threshold).tolist()
         gated_indices = [i for i, g in enumerate(gated_mask) if g]
+
+        if _debug:
+            logger.debug(
+                f"[ERL Step {_step}] Phase 2 — Gating (threshold={self.args.reward_threshold})\n"
+                f"  Gated: {len(gated_indices)}/{len(y1_texts)} samples\n"
+                f"  Gated indices: {gated_indices}"
+            )
 
         if not gated_indices:
             self._internalization_pairs = []
@@ -685,6 +717,13 @@ class ERLTrainer(GRPOTrainer):
             completion_mask_d, old_logps_d, ref_logps_d,
         ) = self._erl_generate(reflection_prompts, compute_logps=compute_logps)
 
+        if _debug:
+            logger.debug(
+                f"[ERL Step {_step}] Phase 3 — Reflection\n"
+                f"  Generated {len(reflection_texts)} reflections\n"
+                f"  Reflection sample (first): \"{reflection_texts[0][:150]}...\""
+            )
+
         # ── Phase 4: Second attempt (batched) ───────────────────────────────
         retry_prompts: list[str] = [
             self._build_retry_prompt(
@@ -708,6 +747,18 @@ class ERLTrainer(GRPOTrainer):
 
         y2_rewards = self._erl_compute_rewards(gated_inputs, gated_prompts, completions_y2)
 
+        if _debug:
+            r2_list = [round(r, 3) for r in y2_rewards.tolist()]
+            gated_r1 = [round(y1_rewards[i].item(), 3) for i in gated_indices]
+            improved = sum(1 for r1, r2 in zip(gated_r1, r2_list) if r2 > r1)
+            logger.debug(
+                f"[ERL Step {_step}] Phase 4 — Second Attempt\n"
+                f"  Y2 rewards: {r2_list}\n"
+                f"  Y2 reward mean: {y2_rewards.mean().item():.3f}\n"
+                f"  Y2 sample (first): \"{y2_texts[0][:100]}...\"\n"
+                f"  Improvement: {improved}/{len(gated_indices)} samples improved"
+            )
+
         # ── Phase 5: Memory update ───────────────────────────────────────────
         if self.args.enable_memory and self.memory is not None:
             for j, i in enumerate(gated_indices):
@@ -716,6 +767,18 @@ class ERLTrainer(GRPOTrainer):
                     self.memory.add(
                         reflection_texts[j], prompt_str, float(y2_rewards[j].item())
                     )
+
+        if _debug:
+            mem_added = sum(
+                1 for j in range(len(gated_indices))
+                if y2_rewards[j].item() > self.args.reward_threshold
+            )
+            mem_size = len(self.memory) if self.memory is not None else 0
+            logger.debug(
+                f"[ERL Step {_step}] Phase 5 — Memory Update\n"
+                f"  New entries added: {mem_added}\n"
+                f"  Total memory size: {mem_size}"
+            )
 
         # ── Phase 6: Re-normalise advantages with y1 rewards ─────────────────
         combined_rewards = y1_rewards.clone()
@@ -727,6 +790,13 @@ class ERLTrainer(GRPOTrainer):
         if getattr(self, "scale_rewards", True):
             new_advantages = new_advantages / (std_grouped + 1e-4)
         y1_result["advantages"] = new_advantages
+
+        if _debug:
+            adv_sample = [round(a, 3) for a in new_advantages[:4].tolist()]
+            logger.debug(
+                f"[ERL Step {_step}] Phase 6 — Advantages\n"
+                f"  Y1 advantages (first 4): {adv_sample}"
+            )
 
         # ── Phase 6b: Store Δ + y2 RL data ───────────────────────────────────
         if compute_logps:
@@ -841,6 +911,9 @@ class ERLTrainer(GRPOTrainer):
         else:
             loss = result
 
+        erl_rl_loss = torch.tensor(0.0, device=loss.device)
+        intern_loss = torch.tensor(0.0, device=loss.device)
+
         if self.args.erl_rl_coef > 0.0 and self._erl_rl_data is not None:
             delta_batch = {
                 **self._erl_rl_data["delta"],
@@ -850,14 +923,25 @@ class ERLTrainer(GRPOTrainer):
                 **self._erl_rl_data["y2"],
                 "advantages": self._erl_rl_data["advantages"],
             }
-            erl_rl = (
+            erl_rl_loss = (
                 self._erl_grpo_loss(model, delta_batch)
                 + self._erl_grpo_loss(model, y2_batch)
             ) / 2.0
-            loss = loss + self.args.erl_rl_coef * erl_rl
+            loss = loss + self.args.erl_rl_coef * erl_rl_loss
 
         if self.args.enable_internalization and self._internalization_pairs:
-            loss = loss + self.args.internalization_coef * self._compute_internalization_loss(model)
+            intern_loss = self._compute_internalization_loss(model)
+            loss = loss + self.args.internalization_coef * intern_loss
+
+        if self.args.debug:
+            logger.debug(
+                f"[ERL Step {self.state.global_step}] Losses\n"
+                f"  GRPO loss (y1): {(loss - self.args.erl_rl_coef * erl_rl_loss - self.args.internalization_coef * intern_loss).item():.4f}\n"
+                f"  ERL RL loss (Δ+y2): {erl_rl_loss.item():.4f}\n"
+                f"  Internalization loss: {intern_loss.item():.4f}\n"
+                f"  Total loss: {loss.item():.4f}\n"
+                f"  Internalization pairs: {len(self._internalization_pairs)}"
+            )
 
         if return_outputs:
             return loss, outputs

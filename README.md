@@ -121,6 +121,7 @@ All `GRPOConfig` options are inherited. ERL adds:
 | `erl_rl_coef` | `1.0` | Weight of Δ+y2 GRPO loss. Set to `0.0` for Algorithm 1 mode. |
 | `enable_memory` | `True` | Toggle cross-episode memory on/off. |
 | `enable_internalization` | `True` | Toggle the distillation step on/off. |
+| `debug` | `False` | Enable detailed per-step logging of every ERL phase. |
 
 ## Implementation Notes
 
