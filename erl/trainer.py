@@ -187,6 +187,7 @@ class ERLTrainer(GRPOTrainer):
                 handler = logging.StreamHandler()
                 handler.setFormatter(logging.Formatter("%(message)s"))
                 logger.addHandler(handler)
+            logger.propagate = False
 
     # ------------------------------------------------------------------
     # Prompt construction helpers
