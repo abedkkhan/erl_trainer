@@ -771,9 +771,7 @@ class ERLTrainer(GRPOTrainer):
         by gradient accumulation steps to match the GRPO loss scale."""
         pairs = self._internalization_pairs
         if not pairs:
-            return torch.tensor(
-                0.0, device=self.accelerator.device, requires_grad=True
-            )
+            return torch.tensor(0.0, device=self.accelerator.device)
 
         device = self.accelerator.device
         tokenizer = self.processing_class
