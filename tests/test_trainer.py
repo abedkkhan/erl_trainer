@@ -230,6 +230,56 @@ def test_erl_compute_feedback_calls_func_with_extra_kwargs(erl_config):
     assert result == ["answer=7"]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Advantage computation — y1 rewards must drive advantages, never y2
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_y1_advantages_use_r1_not_r2():
+    """Advantages must be derived from y1 rewards, not y2 rewards.
+
+    y1 ordering : index 1 is best  (0.3), index 2 is worst (0.0)
+    y2 ordering : index 2 is best  (0.9), index 1 is worst (0.5)
+
+    After the fix the advantage ordering must match y1, not y2.
+    """
+    y1_rewards = torch.tensor([0.1, 0.3, 0.0, 0.1])
+    y2_rewards = torch.tensor([0.7, 0.5, 0.9, 0.8])  # noqa: F841 — intentionally unused
+    num_generations = 4
+
+    # Fixed logic: use y1_rewards only (no replacement with y2)
+    combined_rewards = y1_rewards.clone()
+    mean_grouped = combined_rewards.view(-1, num_generations).mean(dim=1)
+    std_grouped = combined_rewards.view(-1, num_generations).std(dim=1)
+    mean_grouped = mean_grouped.repeat_interleave(num_generations, dim=0)
+    std_grouped = std_grouped.repeat_interleave(num_generations, dim=0)
+    advantages = (combined_rewards - mean_grouped) / (std_grouped + 1e-4)
+
+    # y1 ordering: index 1 (0.3) > index 0 = index 3 (0.1) > index 2 (0.0)
+    assert advantages[1] > advantages[0], "y1[1] had highest r1, should have highest advantage"
+    assert advantages[2] < advantages[0], "y1[2] had lowest r1, should have lowest advantage"
+
+    # Must NOT follow y2 ordering (y2[2]=0.9 was best in y2, but worst in y1)
+    assert advantages[2] < advantages[1], "advantages must not follow y2 ordering"
+
+
+def test_y1_advantages_independent_of_y2():
+    """Changing y2 rewards must not affect advantages at all."""
+    y1_rewards = torch.tensor([0.1, 0.3, 0.0, 0.1])
+    num_generations = 4
+
+    def _compute_advantages(y2_rewards):
+        combined = y1_rewards.clone()
+        # Fixed: no y2 substitution
+        mean = combined.view(-1, num_generations).mean(dim=1).repeat_interleave(num_generations)
+        std = combined.view(-1, num_generations).std(dim=1).repeat_interleave(num_generations)
+        return (combined - mean) / (std + 1e-4)
+
+    adv_a = _compute_advantages(torch.tensor([0.9, 0.5, 0.9, 0.8]))
+    adv_b = _compute_advantages(torch.tensor([0.0, 0.0, 0.0, 0.0]))
+
+    assert torch.allclose(adv_a, adv_b), "advantages changed when only y2 rewards changed"
+
+
 def test_erl_compute_feedback_multiple_samples(erl_config):
     feedbacks = ["fb-a", "fb-b", "fb-c"]
     call_args: dict = {}

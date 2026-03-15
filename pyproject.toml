@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "erl-trainer"
-version = "0.2.0"
+version = "0.2.1"
 description = "Experiential Reinforcement Learning (ERL) — a thin wrapper on HuggingFace TRL's GRPOTrainer implementing the ERL algorithm with reflection, memory, and internalization."
 readme = "README.md"
 license = { file = "LICENSE" }

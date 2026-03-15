@@ -417,12 +417,17 @@ class ERLTrainer(GRPOTrainer):
                         reflection_texts[j], prompt_str, float(y2_rewards[j].item())
                     )
 
-        # ── Phase 6: Re-normalise advantages with ERL-combined rewards ───────
-        # For non-gated samples: keep y1 reward.
-        # For gated samples: replace with y2 reward (the second attempt score).
+        # ── Phase 6: Re-normalise advantages with y1 rewards ─────────────────
+        # completion_ids in y1_result are y1 TOKENS, so advantages must be
+        # derived from r1 (y1 rewards).  Replacing with r2 here would credit
+        # y1 tokens for the quality of an entirely different generation (y2),
+        # which contradicts both Algorithm 1 and Algorithm 2 of the paper.
+        # y2 rewards are used only for memory gating and internalization above.
+        #
+        # The recomputation is kept even though it mirrors what the parent
+        # already computed from y1 rewards, because it will be the natural
+        # hook when Δ and y2 tokens are later added to the RL batch.
         combined_rewards = y1_rewards.clone()
-        for j, i in enumerate(gated_indices):
-            combined_rewards[i] = y2_rewards[j]
 
         # Group-wise normalisation (same formula as parent).
         mean_grouped = combined_rewards.view(-1, self.num_generations).mean(dim=1)
