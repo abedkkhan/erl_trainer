@@ -632,7 +632,7 @@ def test_cached_rewards_match_computed_rewards():
 def test_debug_config_defaults_false(tmp_path):
     """debug must default to False."""
     config = ERLConfig(output_dir=str(tmp_path), report_to="none")
-    assert config.debug is False
+    assert config.erl_debug is False
 
 
 @pytest.mark.skip(reason="Requires model download; run manually.")
@@ -647,7 +647,7 @@ def test_debug_logging_no_crash(tmp_path):
         max_completion_length=16,
         per_device_train_batch_size=2,
         reward_threshold=0.5,
-        debug=True,
+        erl_debug=True,
         report_to="none",
     )
 
@@ -667,7 +667,7 @@ def test_debug_configures_logger(erl_config):
     """When debug=True, the 'erl' logger must be set to DEBUG level."""
     import logging as _logging
 
-    erl_config.debug = True
+    erl_config.erl_debug = True
     try:
         trainer = ERLTrainer(  # noqa: F841
             model=TINY_MODEL,
@@ -684,7 +684,7 @@ def test_no_debug_logger_untouched(tmp_path):
     """When debug=False, the 'erl' logger level must remain unchanged."""
     import logging as _logging
 
-    config = ERLConfig(output_dir=str(tmp_path), debug=False, report_to="none")
+    config = ERLConfig(output_dir=str(tmp_path), erl_debug=False, report_to="none")
     erl_logger = _logging.getLogger("erl")
     original_level = erl_logger.level
     try:

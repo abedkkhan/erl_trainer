@@ -181,7 +181,7 @@ class ERLTrainer(GRPOTrainer):
         self._internalization_pairs: list[tuple[Any, str]] = []
         self._erl_rl_data: dict | None = None
 
-        if self.args.debug:
+        if self.args.erl_debug:
             logger.setLevel(logging.DEBUG)
             if not logger.handlers:
                 handler = logging.StreamHandler()
@@ -633,7 +633,7 @@ class ERLTrainer(GRPOTrainer):
         """Run the full ERL loop and return a batch dict for ``_compute_loss``."""
         inputs = _to_list_of_dicts(inputs)
 
-        _debug = self.args.debug
+        _debug = self.args.erl_debug
         if _debug:
             _step = self.state.global_step
 
@@ -933,7 +933,7 @@ class ERLTrainer(GRPOTrainer):
             intern_loss = self._compute_internalization_loss(model)
             loss = loss + self.args.internalization_coef * intern_loss
 
-        if self.args.debug:
+        if self.args.erl_debug:
             logger.debug(
                 f"[ERL Step {self.state.global_step}] Losses\n"
                 f"  GRPO loss (y1): {(loss - self.args.erl_rl_coef * erl_rl_loss - self.args.internalization_coef * intern_loss).item():.4f}\n"

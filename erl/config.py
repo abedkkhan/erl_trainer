@@ -81,7 +81,7 @@ class ERLConfig(GRPOConfig):
             )
         },
     )
-    debug: bool = field(
+    erl_debug: bool = field(
         default=False,
         metadata={
             "help": (
