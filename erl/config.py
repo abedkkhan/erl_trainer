@@ -20,6 +20,8 @@ class ERLConfig(GRPOConfig):
         internalization_coef: Weight of the internalization (distillation) loss relative to RL loss.
         enable_memory: Toggle cross-episode memory on/off.
         enable_internalization: Toggle the distillation step on/off.
+        erl_rl_coef: Weight of the ERL RL loss on Δ and y2 relative to the y1 RL loss.
+            Set to 0.0 to disable RL updates on reflections and second attempts (Algorithm 1 mode).
     """
 
     reward_threshold: float = field(
@@ -63,4 +65,13 @@ class ERLConfig(GRPOConfig):
     enable_internalization: bool = field(
         default=True,
         metadata={"help": "Toggle the distillation step on/off."},
+    )
+    erl_rl_coef: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Weight of the ERL RL loss (Δ + y2 GRPO) relative to the y1 RL loss. "
+                "Set to 0.0 to disable RL updates on reflections and second attempts."
+            )
+        },
     )

@@ -70,13 +70,23 @@ class ERLTrainer(GRPOTrainer):
     """Experiential Reinforcement Learning trainer for TRL 0.17.0+.
 
     Extends ``GRPOTrainer`` by overriding ``_generate_and_score_completions``
-    to inject the ERL reflection-retry-internalization loop after the first
-    attempt.  The returned dict has the same keys as the parent's method, so
-    ``_compute_loss`` works without modification.
+    to inject the full ERL reflection-retry-internalization loop after the
+    first attempt.  The returned dict has the same keys as the parent's method,
+    so ``_compute_loss`` works without modification.
 
-    Algorithm 1 (combined update) from the ERL paper is implemented:
-    the advantages tensor is replaced with ERL-corrected advantages before
-    the GRPO loss is computed.
+    This implementation follows **Algorithm 2** from the ERL paper:
+
+    * **y1 RL update** — delegated to the parent's GRPO loss on first-attempt
+      completions.  Advantages are derived from r1 (y1 rewards) only (Algorithm
+      1 style, consistent with the parent's batched normalisation).
+    * **Δ + y2 RL update** — a separate GRPO loss computed in ``compute_loss``
+      using the stored ``_erl_rl_data``.  Both Δ (reflections) and y2
+      (second-attempt completions) receive reward r2; advantages are
+      batch-wide-normalised (since each gated sample contributes exactly one Δ
+      and one y2, making per-group normalisation degenerate).
+    * **Internalization** — SFT cross-entropy on ``(original_prompt → y2)``
+      for successful second attempts (r2 > 0), training the model to produce
+      improved answers at inference time without any reflection scaffold.
 
     Args:
         model: Model to train (same as GRPOTrainer).
@@ -106,6 +116,10 @@ class ERLTrainer(GRPOTrainer):
         # Populated each step by _generate_and_score_completions; consumed by
         # compute_loss for the internalization (distillation) loss.
         self._internalization_pairs: list[tuple[Any, str]] = []
+        # Populated each step by _generate_and_score_completions; consumed by
+        # compute_loss for the ERL RL loss on Δ and y2.  None when no samples
+        # were gated or when erl_rl_coef == 0.
+        self._erl_rl_data: dict | None = None
 
     # ------------------------------------------------------------------
     # Prompt construction helpers
@@ -142,8 +156,11 @@ class ERLTrainer(GRPOTrainer):
 
     @torch.no_grad()
     def _erl_generate(
-        self, prompt_texts: list[str]
-    ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+        self,
+        prompt_texts: list[str],
+        *,
+        compute_logps: bool = False,
+    ) -> tuple:
         """Generate one completion per plain-text prompt string.
 
         Formats each prompt as a single-turn user message, applies the model's
@@ -156,15 +173,20 @@ class ERLTrainer(GRPOTrainer):
 
         Args:
             prompt_texts: Plain-text content for each prompt.
+            compute_logps: When ``True``, also compute per-token log-probs from
+                the current policy and reference model (if available).  These
+                are used as the "old" log-probs for the ERL GRPO loss.
 
         Returns:
-            ``(prompt_ids, completion_ids, completion_texts)`` all on the
-            accelerator device.
+            7-tuple ``(prompt_ids, prompt_mask, completion_ids, completion_texts,
+            completion_mask, old_per_token_logps, ref_per_token_logps)``.
+            ``completion_mask``, ``old_per_token_logps``, and
+            ``ref_per_token_logps`` are ``None`` when ``compute_logps=False``.
         """
         if not prompt_texts:
             device = self.accelerator.device
             empty = torch.zeros(0, 0, dtype=torch.long, device=device)
-            return empty, empty, []
+            return empty, empty, empty, [], None, None, None
 
         device = self.accelerator.device
         tokenizer = self.processing_class
@@ -209,7 +231,47 @@ class ERLTrainer(GRPOTrainer):
         completion_ids = prompt_completion_ids[:, prompt_length:]
         completion_texts = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
 
-        return prompt_ids, completion_ids, completion_texts
+        if not compute_logps:
+            return prompt_ids, prompt_mask, completion_ids, completion_texts, None, None, None
+
+        # ── EOS masking ────────────────────────────────────────────────────────
+        C = completion_ids.shape[1]
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is not None:
+            is_eos = completion_ids == eos_token_id
+            eos_idx = is_eos.int().argmax(dim=1)
+            has_eos = is_eos.any(dim=1)
+            eos_idx = torch.where(has_eos, eos_idx, torch.full_like(eos_idx, C - 1))
+        else:
+            eos_idx = torch.full((completion_ids.shape[0],), C - 1, device=device)
+        seq_idx = torch.arange(C, device=device).unsqueeze(0)
+        completion_mask = (seq_idx <= eos_idx.unsqueeze(1)).long()
+
+        # ── Old policy log-probs ───────────────────────────────────────────────
+        full_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+            self.model, prompt_completion_ids, full_mask, logits_to_keep=C
+        )  # (B, C)
+
+        # ── Reference model log-probs (for KL penalty when beta != 0) ─────────
+        ref_model = getattr(self, "ref_model", None)
+        beta = getattr(self, "beta", 0.0)
+        if ref_model is not None and beta != 0.0:
+            ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                ref_model, prompt_completion_ids, full_mask, logits_to_keep=C
+            )  # (B, C)
+        else:
+            ref_per_token_logps = None
+
+        return (
+            prompt_ids,
+            prompt_mask,
+            completion_ids,
+            completion_texts,
+            completion_mask,
+            old_per_token_logps,
+            ref_per_token_logps,
+        )
 
     # ------------------------------------------------------------------
     # Reward and feedback helpers
@@ -315,6 +377,154 @@ class ERLTrainer(GRPOTrainer):
         )
 
     # ------------------------------------------------------------------
+    # Advantage normalisation for Δ and y2
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _erl_compute_r2_advantages(rewards: torch.Tensor) -> torch.Tensor:
+        """Batch-wide advantage normalisation for Δ and y2 rewards.
+
+        Unlike y1 which uses group-wise normalisation (GRPO), Δ and y2 use
+        batch-wide normalisation because each gated sample produces exactly one
+        Δ and one y2 (group size 1), making per-group std identically zero.
+
+        Args:
+            rewards: 1-D tensor of r2 rewards for all gated samples, shape
+                ``(N,)``.
+
+        Returns:
+            Normalised advantages, same shape.  Returns all-zeros when
+            ``N <= 1`` (single sample → no meaningful normalisation possible).
+        """
+        if rewards.shape[0] <= 1:
+            return torch.zeros_like(rewards)
+        mean = rewards.mean()
+        std = rewards.std()
+        return (rewards - mean) / (std + 1e-4)
+
+    # ------------------------------------------------------------------
+    # GRPO loss for Δ and y2 completions
+    # ------------------------------------------------------------------
+
+    def _erl_grpo_loss(self, model: nn.Module, batch: dict) -> torch.Tensor:
+        """GRPO loss for Δ (reflection) or y2 (second-attempt) completions.
+
+        Replicates the parent's ``_compute_loss`` formula without the metrics
+        logging, so this can be called twice per step (once for Δ, once for
+        y2) without double-counting metrics.
+
+        Args:
+            model: Current training model (Accelerate-wrapped).
+            batch: Dict with keys ``prompt_ids``, ``prompt_mask``,
+                ``completion_ids``, ``completion_mask``,
+                ``old_per_token_logps``, ``ref_per_token_logps`` (may be
+                ``None``), ``advantages``.
+
+        Returns:
+            Scalar loss tensor with gradients attached.
+        """
+        prompt_ids  = batch["prompt_ids"]
+        prompt_mask = batch["prompt_mask"]
+        completion_ids  = batch["completion_ids"]
+        completion_mask = batch["completion_mask"].float()      # (N, C)
+        old_per_token_logps = batch["old_per_token_logps"]     # (N, C)
+        ref_per_token_logps = batch.get("ref_per_token_logps") # (N, C) or None
+        advantages  = batch["advantages"]                       # (N,)
+
+        C = completion_ids.shape[1]
+        input_ids      = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask.long()], dim=1)
+
+        # Current-policy log-probs (with gradient)
+        per_token_logps, _ = self._get_per_token_logps_and_entropies(
+            model, input_ids, attention_mask, logits_to_keep=C
+        )  # (N, C)
+
+        if advantages.dim() == 1:
+            advantages = advantages.unsqueeze(1)  # (N, 1) for broadcasting
+
+        # Old log-probs fallback (shouldn't be None in normal ERL flow)
+        if old_per_token_logps is None:
+            old_per_token_logps = per_token_logps.detach()
+
+        # Importance-sampling ratio
+        log_ratio = per_token_logps - old_per_token_logps
+        if getattr(self, "importance_sampling_level", "token") == "token":
+            log_iw = log_ratio
+        else:  # sequence
+            log_iw = (
+                (log_ratio * completion_mask).sum(-1)
+                / completion_mask.sum(-1).clamp(min=1.0)
+            ).unsqueeze(-1)
+
+        coef_1 = torch.exp(log_iw)
+
+        # KL divergence penalty (mirrors parent when beta != 0)
+        beta = getattr(self, "beta", 0.0)
+        per_token_kl = None
+        if beta != 0.0 and ref_per_token_logps is not None:
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps)
+                - (ref_per_token_logps - per_token_logps)
+                - 1
+            )
+
+        # Per-token loss (PPO clip formula)
+        loss_type = getattr(self, "loss_type", "grpo")
+        eps_low  = getattr(self, "epsilon_low",  0.2)
+        eps_high = getattr(self, "epsilon_high", 0.2)
+
+        if loss_type in ("grpo", "bnpo", "dr_grpo", "dapo", "luspo"):
+            coef_2 = torch.clamp(coef_1, 1 - eps_low, 1 + eps_high)
+            per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+        elif loss_type == "cispo":
+            clamped = torch.clamp(coef_1, max=eps_high).detach()
+            per_token_loss = -clamped * advantages * per_token_logps
+        elif loss_type == "sapo":
+            temps = torch.where(
+                advantages > 0,
+                torch.full_like(advantages, self.args.sapo_temperature_pos),
+                torch.full_like(advantages, self.args.sapo_temperature_neg),
+            )
+            soft_coef = torch.sigmoid(temps * (coef_1 - 1)) * 4 / temps
+            per_token_loss = -soft_coef * advantages
+        else:
+            # Unknown loss type — fall back to grpo formula
+            coef_2 = torch.clamp(coef_1, 1 - eps_low, 1 + eps_high)
+            per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+
+        if per_token_kl is not None:
+            per_token_loss = per_token_loss + beta * per_token_kl
+
+        mask = completion_mask
+        mode = "train" if model.training else "eval"
+        normalizer = (
+            self.current_gradient_accumulation_steps if mode == "train" else 1.0
+        )
+
+        if loss_type in ("grpo", "sapo", "dapo"):
+            loss = (
+                (per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+            ).mean() / normalizer
+        elif loss_type == "bnpo":
+            loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0) / normalizer
+        elif loss_type == "dr_grpo":
+            loss = (
+                (per_token_loss * mask).sum()
+                / (per_token_loss.size(0) * self.max_completion_length)
+                / normalizer
+            )
+        elif loss_type == "luspo":
+            loss = (per_token_loss * mask.sum(1, keepdim=True)).mean() / normalizer
+        else:
+            # Fallback to grpo formula
+            loss = (
+                (per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+            ).mean() / normalizer
+
+        return loss
+
+    # ------------------------------------------------------------------
     # Main ERL loop
     # ------------------------------------------------------------------
 
@@ -366,7 +576,11 @@ class ERLTrainer(GRPOTrainer):
 
         if not gated_indices:
             self._internalization_pairs = []
+            self._erl_rl_data = None
             return y1_result
+
+        # Whether to compute log-probs for the ERL RL loss on Δ + y2
+        compute_logps = self.args.erl_rl_coef > 0.0
 
         # ── Phase 3: Self-reflection (batched) ──────────────────────────────
         reflection_prompts: list[str] = []
@@ -387,7 +601,10 @@ class ERLTrainer(GRPOTrainer):
                 )
             )
 
-        _, _, reflection_texts = self._erl_generate(reflection_prompts)
+        (
+            prompt_ids_d, prompt_mask_d, completion_ids_d, reflection_texts,
+            completion_mask_d, old_logps_d, ref_logps_d,
+        ) = self._erl_generate(reflection_prompts, compute_logps=compute_logps)
 
         # ── Phase 4: Second attempt (batched) ───────────────────────────────
         retry_prompts: list[str] = [
@@ -397,7 +614,11 @@ class ERLTrainer(GRPOTrainer):
             )
             for j, i in enumerate(gated_indices)
         ]
-        _, _, y2_texts = self._erl_generate(retry_prompts)
+
+        (
+            prompt_ids_y2, prompt_mask_y2, completion_ids_y2, y2_texts,
+            completion_mask_y2, old_logps_y2, ref_logps_y2,
+        ) = self._erl_generate(retry_prompts, compute_logps=compute_logps)
 
         gated_inputs = [inputs_orig[i] for i in gated_indices]
         gated_prompts = [prompts_raw[i] for i in gated_indices]
@@ -422,11 +643,6 @@ class ERLTrainer(GRPOTrainer):
         # derived from r1 (y1 rewards).  Replacing with r2 here would credit
         # y1 tokens for the quality of an entirely different generation (y2),
         # which contradicts both Algorithm 1 and Algorithm 2 of the paper.
-        # y2 rewards are used only for memory gating and internalization above.
-        #
-        # The recomputation is kept even though it mirrors what the parent
-        # already computed from y1 rewards, because it will be the natural
-        # hook when Δ and y2 tokens are later added to the RL batch.
         combined_rewards = y1_rewards.clone()
 
         # Group-wise normalisation (same formula as parent).
@@ -439,6 +655,34 @@ class ERLTrainer(GRPOTrainer):
             new_advantages = new_advantages / (std_grouped + 1e-4)
 
         y1_result["advantages"] = new_advantages
+
+        # ── Phase 6b: Store Δ + y2 RL data for compute_loss ─────────────────
+        # Advantages are batch-wide-normalised from r2 rewards because each
+        # gated sample produces exactly one Δ and one y2 (group size 1 makes
+        # per-group normalisation degenerate with std=0).
+        if compute_logps:
+            y2_advantages = self._erl_compute_r2_advantages(y2_rewards)
+            self._erl_rl_data = {
+                "delta": {
+                    "prompt_ids":          prompt_ids_d,
+                    "prompt_mask":         prompt_mask_d,
+                    "completion_ids":      completion_ids_d,
+                    "completion_mask":     completion_mask_d,
+                    "old_per_token_logps": old_logps_d,
+                    "ref_per_token_logps": ref_logps_d,
+                },
+                "y2": {
+                    "prompt_ids":          prompt_ids_y2,
+                    "prompt_mask":         prompt_mask_y2,
+                    "completion_ids":      completion_ids_y2,
+                    "completion_mask":     completion_mask_y2,
+                    "old_per_token_logps": old_logps_y2,
+                    "ref_per_token_logps": ref_logps_y2,
+                },
+                "advantages": y2_advantages,
+            }
+        else:
+            self._erl_rl_data = None
 
         # ── Phase 7: Store internalization pairs ─────────────────────────────
         self._internalization_pairs = []
@@ -531,7 +775,7 @@ class ERLTrainer(GRPOTrainer):
         return_outputs: bool = False,
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
-        """GRPO loss (Phase 6) plus optional internalization loss (Phase 7).
+        """y1 GRPO loss + optional ERL RL loss on Δ+y2 + optional internalization.
 
         Args:
             model: Training model passed by the Trainer loop.
@@ -550,13 +794,31 @@ class ERLTrainer(GRPOTrainer):
             num_items_in_batch=num_items_in_batch,
         )
 
-        if not (self.args.enable_internalization and self._internalization_pairs):
-            return result
-
-        distill_loss = self._compute_internalization_loss(model)
-
         if return_outputs:
             loss, outputs = result
-            return loss + self.args.internalization_coef * distill_loss, outputs
+        else:
+            loss = result
 
-        return result + self.args.internalization_coef * distill_loss
+        # ERL RL loss: GRPO on Δ (reflections) and y2 (second attempts)
+        if self.args.erl_rl_coef > 0.0 and self._erl_rl_data is not None:
+            delta_batch = {
+                **self._erl_rl_data["delta"],
+                "advantages": self._erl_rl_data["advantages"],
+            }
+            y2_batch = {
+                **self._erl_rl_data["y2"],
+                "advantages": self._erl_rl_data["advantages"],
+            }
+            erl_rl = (
+                self._erl_grpo_loss(model, delta_batch)
+                + self._erl_grpo_loss(model, y2_batch)
+            ) / 2.0
+            loss = loss + self.args.erl_rl_coef * erl_rl
+
+        # Internalization loss: SFT on (original_prompt → y2)
+        if self.args.enable_internalization and self._internalization_pairs:
+            loss = loss + self.args.internalization_coef * self._compute_internalization_loss(model)
+
+        if return_outputs:
+            return loss, outputs
+        return loss

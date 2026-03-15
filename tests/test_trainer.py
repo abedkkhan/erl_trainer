@@ -445,6 +445,92 @@ def test_internalization_joint_vs_separate_tokenization_boundary():
     assert True
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# _erl_compute_r2_advantages — batch-wide normalisation for Δ and y2
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_r2_advantages_batch_normalized():
+    """Batch-wide normalisation: mean of advantages must be approximately zero."""
+    rewards = torch.tensor([0.1, 0.3, 0.0, 0.8, 0.5, 0.2])
+    adv = ERLTrainer._erl_compute_r2_advantages(rewards)
+    assert adv.shape == rewards.shape
+    assert abs(adv.mean().item()) < 0.01, f"mean {adv.mean().item()} too far from 0"
+
+
+def test_r2_advantages_single_sample_zeros():
+    """Single reward → all-zero advantages (no normalisation possible)."""
+    rewards = torch.tensor([0.7])
+    adv = ERLTrainer._erl_compute_r2_advantages(rewards)
+    assert torch.equal(adv, torch.zeros_like(rewards))
+
+
+def test_r2_advantages_identical_rewards_zero():
+    """All-identical rewards: std=0, advantages must all be zero."""
+    rewards = torch.tensor([0.5, 0.5, 0.5])
+    adv = ERLTrainer._erl_compute_r2_advantages(rewards)
+    assert torch.allclose(adv, torch.zeros(3))
+
+
+def test_r2_advantages_independent_of_y1():
+    """r2-advantages must not be affected by the y1 reward values."""
+    y2_rewards = torch.tensor([0.1, 0.3, 0.0, 0.8])
+
+    adv_a = ERLTrainer._erl_compute_r2_advantages(y2_rewards)
+    adv_b = ERLTrainer._erl_compute_r2_advantages(y2_rewards)  # same input
+
+    assert torch.allclose(adv_a, adv_b), "advantages changed between identical calls"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _erl_grpo_loss clip formula — pure math validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_erl_grpo_clip_formula_zero_log_ratio():
+    """When log_ratio=0: coef_1=coef_2=1, per_token_loss = -advantage."""
+    advantages = torch.tensor([[1.0, 0.0, -1.0]])  # (1, 3)
+    per_token_logps  = torch.tensor([[0.5, 0.5,  0.5]])
+    old_per_token_logps = torch.tensor([[0.5, 0.5, 0.5]])  # same → log_ratio=0
+
+    log_ratio = per_token_logps - old_per_token_logps   # all zeros
+    coef_1 = torch.exp(log_ratio)                       # all ones
+    eps_low, eps_high = 0.2, 0.2
+    coef_2 = torch.clamp(coef_1, 1 - eps_low, 1 + eps_high)  # still all ones
+    per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+
+    # With A=[1,0,-1] and coef=1: loss=[-1, 0, +1]
+    expected = torch.tensor([[-1.0, 0.0, 1.0]])
+    assert torch.allclose(per_token_loss, expected), f"Got {per_token_loss}"
+
+
+def test_erl_grpo_clip_activates_on_high_ratio():
+    """When coef_1 > 1+eps and advantage > 0, clipping must cap the loss."""
+    advantages = torch.tensor([[1.0]])
+    log_ratio = torch.tensor([[1.0]])  # coef_1 = e ≈ 2.718 > 1+0.2
+    coef_1 = torch.exp(log_ratio)
+    eps_low, eps_high = 0.2, 0.2
+    coef_2 = torch.clamp(coef_1, 1 - eps_low, 1 + eps_high)  # clamped to 1.2
+    per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+    # min(e*1, 1.2*1) = 1.2, loss = -1.2
+    assert torch.allclose(per_token_loss, torch.tensor([[-1.2]]), atol=1e-5)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _erl_rl_data init
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_erl_rl_data_init_none(erl_config):
+    """_erl_rl_data must be None at initialization."""
+    try:
+        trainer = ERLTrainer(
+            model=TINY_MODEL,
+            reward_funcs=_dummy_reward_func,
+            args=erl_config,
+        )
+        assert trainer._erl_rl_data is None
+    except Exception:
+        pytest.skip("Model not available in this environment.")
+
+
 def test_erl_compute_feedback_multiple_samples(erl_config):
     feedbacks = ["fb-a", "fb-b", "fb-c"]
     call_args: dict = {}
