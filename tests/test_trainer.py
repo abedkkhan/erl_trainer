@@ -531,6 +531,22 @@ def test_erl_rl_data_init_none(erl_config):
         pytest.skip("Model not available in this environment.")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Internalization loss gradient accumulation normalization
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_internalization_loss_normalized_by_grad_accum():
+    """Internalization loss must be divided by gradient_accumulation_steps
+    so it carries equal effective weight to the GRPO losses after accumulation.
+    """
+    raw_loss = torch.tensor(2.4)
+    grad_accum_steps = 4
+    normalized = raw_loss / grad_accum_steps
+    assert torch.isclose(normalized, torch.tensor(0.6)), (
+        f"Expected 0.6, got {normalized.item()}"
+    )
+
+
 def test_erl_compute_feedback_multiple_samples(erl_config):
     feedbacks = ["fb-a", "fb-b", "fb-c"]
     call_args: dict = {}

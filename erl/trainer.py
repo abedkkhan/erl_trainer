@@ -766,7 +766,10 @@ class ERLTrainer(GRPOTrainer):
             attention_mask=batch_attention_mask,
             labels=batch_labels,
         )
-        return outputs.loss
+        loss = outputs.loss
+        if model.training:
+            loss = loss / self.current_gradient_accumulation_steps
+        return loss
 
     def compute_loss(
         self,
