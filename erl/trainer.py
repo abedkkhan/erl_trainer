@@ -229,10 +229,20 @@ class ERLTrainer(GRPOTrainer):
         attention_mask: torch.Tensor,
         logits_to_keep: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Thin wrapper around TRL 0.22.x's per-token log-prob computation."""
-        return self._get_per_token_logps_and_entropies(
+        """Compatibility wrapper for TRL's per-token log-prob computation.
+
+        ``_get_per_token_logps_and_entropies`` was added mid-0.17 series.
+        Falls back to the older ``_get_per_token_logps`` (present in
+        TRL 0.17.0) when the newer method is not available.
+        """
+        if hasattr(self, "_get_per_token_logps_and_entropies"):
+            return self._get_per_token_logps_and_entropies(
+                model, input_ids, attention_mask, logits_to_keep=logits_to_keep
+            )
+        logps = self._get_per_token_logps(
             model, input_ids, attention_mask, logits_to_keep=logits_to_keep
         )
+        return logps, None
 
     # ------------------------------------------------------------------
     # Internal generation helper
