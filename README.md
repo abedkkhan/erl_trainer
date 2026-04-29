@@ -127,9 +127,9 @@ All `GRPOConfig` options are inherited. ERL adds:
 
 ### TRL version compatibility
 
-`erl-trainer 0.3.x` targets **TRL 0.17.x** exclusively.
+`erl-trainer 0.4.x` targets **TRL 0.22.x** exclusively.
 
-In TRL 0.17.0 the monolithic `_generate_and_score_completions` method handles everything — tokenisation, generation, EOS masking, log-probability computation, reward evaluation, advantage normalisation, and metrics logging — and returns a plain dict consumed by `_compute_loss`. There is no separate `_generate`, `_calculate_rewards`, or `_get_per_token_logps_and_entropies`.
+In TRL 0.22.x the monolithic `_generate_and_score_completions` method handles everything — tokenisation, generation, EOS masking, log-probability computation, reward evaluation, advantage normalisation, and metrics logging — and returns a plain dict consumed by `_compute_loss`.
 
 `ERLTrainer` overrides `_generate_and_score_completions` and delegates Phase 1 (first attempt) entirely to the parent. ERL phases 2–7 run on top of the parent's output. The returned dict has the same keys as the parent's method so `_compute_loss` works without modification.
 
@@ -155,6 +155,7 @@ This implementation follows **Algorithm 2** from the ERL paper:
 
 | erl-trainer | TRL | transformers |
 |-------------|-----|--------------|
+| 0.4.x | 0.22.x | ≥ 4.50.0 |
 | 0.3.x | 0.17.x | ≥ 4.50.0 |
 | 0.2.x | 0.17.x | ≥ 4.50.0 |
 | 0.1.x | 0.15.x | ≥ 4.50.0 |

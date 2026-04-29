@@ -232,14 +232,13 @@ class ERLTrainer(GRPOTrainer):
         """Compatibility wrapper for TRL's per-token log-prob computation.
 
         ``_get_per_token_logps_and_entropies`` was added mid-0.17 series.
-        Falls back to the older ``_get_per_token_logps`` when the newer
-        method is not present.
+        Falls back to the older ``_get_per_token_logps`` (present in
+        TRL 0.17.0) when the newer method is not available.
         """
         if hasattr(self, "_get_per_token_logps_and_entropies"):
             return self._get_per_token_logps_and_entropies(
                 model, input_ids, attention_mask, logits_to_keep=logits_to_keep
             )
-        # Older TRL (≤ 0.17.0 initial release)
         logps = self._get_per_token_logps(
             model, input_ids, attention_mask, logits_to_keep=logits_to_keep
         )
@@ -628,6 +627,11 @@ class ERLTrainer(GRPOTrainer):
         mode = "train" if model.training else "eval"
         _gas = getattr(self, "current_gradient_accumulation_steps", None) or self.args.gradient_accumulation_steps
         normalizer = _gas if mode == "train" else 1.0
+        _accum = (
+            getattr(self, "current_gradient_accumulation_steps", None)
+            or self.args.gradient_accumulation_steps
+        )
+        normalizer = _accum if mode == "train" else 1.0
 
         if loss_type in ("grpo", "sapo", "dapo"):
             loss = (
@@ -814,7 +818,8 @@ class ERLTrainer(GRPOTrainer):
         mean_grouped = mean_grouped.repeat_interleave(self.num_generations, dim=0)
         std_grouped = std_grouped.repeat_interleave(self.num_generations, dim=0)
         new_advantages = combined_rewards - mean_grouped
-        if getattr(self, "scale_rewards", True):
+        _scale = getattr(self, "scale_rewards", "group")
+        if _scale is True or (isinstance(_scale, str) and _scale != "none"):
             new_advantages = new_advantages / (std_grouped + 1e-4)
         y1_result["advantages"] = new_advantages
 
@@ -917,6 +922,11 @@ class ERLTrainer(GRPOTrainer):
         if model.training:
             _gas = getattr(self, "current_gradient_accumulation_steps", None) or self.args.gradient_accumulation_steps
             loss = loss / _gas
+            _accum = (
+                getattr(self, "current_gradient_accumulation_steps", None)
+                or self.args.gradient_accumulation_steps
+            )
+            loss = loss / _accum
         return loss
 
     def compute_loss(
