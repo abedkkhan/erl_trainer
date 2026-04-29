@@ -229,12 +229,7 @@ class ERLTrainer(GRPOTrainer):
         attention_mask: torch.Tensor,
         logits_to_keep: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Compatibility wrapper for TRL's per-token log-prob computation.
-
-        ``_get_per_token_logps_and_entropies`` was added mid-0.17 series.
-        Falls back to the older ``_get_per_token_logps`` (present in
-        TRL 0.17.0) when the newer method is not available.
-        """
+        """Thin wrapper that works across TRL versions (0.17.x and 0.22.x)."""
         if hasattr(self, "_get_per_token_logps_and_entropies"):
             return self._get_per_token_logps_and_entropies(
                 model, input_ids, attention_mask, logits_to_keep=logits_to_keep
@@ -625,8 +620,6 @@ class ERLTrainer(GRPOTrainer):
 
         mask = completion_mask
         mode = "train" if model.training else "eval"
-        _gas = getattr(self, "current_gradient_accumulation_steps", None) or self.args.gradient_accumulation_steps
-        normalizer = _gas if mode == "train" else 1.0
         _accum = (
             getattr(self, "current_gradient_accumulation_steps", None)
             or self.args.gradient_accumulation_steps
@@ -920,8 +913,6 @@ class ERLTrainer(GRPOTrainer):
         )
         loss = outputs.loss
         if model.training:
-            _gas = getattr(self, "current_gradient_accumulation_steps", None) or self.args.gradient_accumulation_steps
-            loss = loss / _gas
             _accum = (
                 getattr(self, "current_gradient_accumulation_steps", None)
                 or self.args.gradient_accumulation_steps
