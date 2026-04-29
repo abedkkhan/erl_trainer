@@ -14,7 +14,17 @@ class ReflectionMemory:
 
     Entries are stored in insertion order and evicted oldest-first when the capacity is reached.
     Retrieval is recency-based (most recent entries first), suitable as a starting point before
-    upgrading to embedding-based similarity retrieval.
+    upgrading to embedding-based similarity retrieval. The ``prompt`` argument to
+    :meth:`retrieve` is currently unused and reserved for future similarity-based retrieval.
+
+    .. note::
+
+        This memory is **per-process**. Under multi-GPU / multi-rank training (DDP,
+        DeepSpeed, FSDP), each rank maintains its own deque and entries are *not*
+        synchronised across ranks. As a consequence, different ranks may sample
+        from divergent memory states. If reproducibility across ranks matters,
+        either disable memory (``enable_memory=False``) or extend this class to
+        gather/broadcast new entries on :meth:`add`.
 
     Args:
         max_size: Maximum number of reflection entries to store.

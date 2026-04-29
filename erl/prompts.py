@@ -13,7 +13,7 @@ You are analyzing a failed attempt at a task to help improve the next attempt.
 ## Reward Score
 {reward}
 
-## Relevant Past Reflections
+## Recent Reflections
 {memory}
 
 Based on the above, write a concise reflection:
