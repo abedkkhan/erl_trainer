@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 from typing import Any, Callable
 
@@ -14,8 +15,10 @@ from erl.config import ERLConfig
 from erl.memory import ReflectionMemory
 
 # ---------------------------------------------------------------------------
-# TRL 0.17.0 data utilities — import with fallbacks so unit tests that run
-# without a full TRL install still work.
+# TRL 0.17.x data utilities — imported with fallbacks so unit tests that run
+# without a full TRL install still work. The dep pin in pyproject.toml is
+# trl>=0.17.0,<0.18.0; if you bump the pin, retest the helpers below and the
+# parent ``_generate_and_score_completions`` / ``_compute_loss`` signatures.
 # ---------------------------------------------------------------------------
 try:
     from trl.data_utils import maybe_apply_chat_template, is_conversational
@@ -55,13 +58,35 @@ def _to_list_of_dicts(inputs: list[dict] | dict[str, Any]) -> list[dict]:
     return [{k: inputs[k][i] for k in keys} for i in range(n)]
 
 
-def _prompt_to_text(prompt: Any, tokenizer: Any) -> str:
-    """Convert a prompt (string or list of message dicts) to plain text."""
+def _prompt_to_text(prompt: Any, tokenizer: Any, *, add_generation_prompt: bool = False) -> str:
+    """Convert a prompt (string or list of message dicts) to plain text.
+
+    By default this does *not* append the assistant generation header — the
+    returned text is meant to be embedded as content inside another chat
+    template (e.g., the reflection prompt). Pass ``add_generation_prompt=True``
+    when you intend to use the result as a standalone prompt to ``generate``.
+    """
     if isinstance(prompt, str):
         return prompt
     return tokenizer.apply_chat_template(
-        prompt, tokenize=False, add_generation_prompt=True
+        prompt, tokenize=False, add_generation_prompt=add_generation_prompt
     )
+
+
+def _format_safe(template: str, **kwargs: Any) -> str:
+    """``str.format`` that tolerates unrelated ``{...}`` patterns in values.
+
+    User-supplied content (model attempts, feedback strings) may contain
+    literal braces, e.g., LaTeX or JSON snippets. Using ``str.format`` directly
+    raises ``KeyError`` / ``IndexError`` on those. This helper escapes braces
+    in every substituted value so only the explicit template placeholders are
+    interpreted.
+    """
+    safe = {
+        k: (str(v).replace("{", "{{").replace("}", "}}") if isinstance(v, str) else v)
+        for k, v in kwargs.items()
+    }
+    return template.format(**safe)
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +112,10 @@ class _CachingRewardWrapper:
         self.func = func
         self.last_rewards: list[float] | None = None
         self.last_feedback: list[str] | None = None
-        # Preserve name so TRL's reward_func_names lookup still works
-        if hasattr(func, "__name__"):
-            self.__name__ = func.__name__
+        # Copy ``__name__``, ``__qualname__``, ``__doc__``, ``__module__`` so
+        # TRL's reward_func_names lookup and any other attribute-based
+        # introspection keeps working through the wrapper.
+        functools.update_wrapper(self, func, updated=())
 
     def __call__(self, prompts, completions, **kwargs):
         raw = self.func(prompts=prompts, completions=completions, **kwargs)
@@ -201,9 +227,14 @@ class ERLTrainer(GRPOTrainer):
         reward: float,
         memory_entries: list[str],
     ) -> str:
-        """Format the reflection prompt using the configured template."""
+        """Format the reflection prompt using the configured template.
+
+        Uses ``_format_safe`` so braces in user content (LaTeX, JSON) cannot
+        break the template substitution.
+        """
         memory_str = "\n\n".join(memory_entries) if memory_entries else "None available."
-        return self.args.reflection_system_prompt.format(
+        return _format_safe(
+            self.args.reflection_system_prompt,
             prompt=prompt,
             attempt=attempt,
             feedback=feedback,
@@ -213,7 +244,8 @@ class ERLTrainer(GRPOTrainer):
 
     def _build_retry_prompt(self, prompt: str, reflection: str) -> str:
         """Format the retry prompt using the configured template."""
-        return self.args.retry_system_prompt.format(
+        return _format_safe(
+            self.args.retry_system_prompt,
             prompt=prompt,
             reflection=reflection,
         )
@@ -298,7 +330,10 @@ class ERLTrainer(GRPOTrainer):
             prompt_ids = prompt_ids[:, -max_prompt_length:]
             prompt_mask = prompt_mask[:, -max_prompt_length:]
 
-        gather_ds3 = getattr(self.args, "ds3_gather_for_generation", False)
+        # Default matches GRPOConfig (True). Reading False here would break
+        # generation under DeepSpeed ZeRO-3 because parameters would be sharded
+        # across ranks.
+        gather_ds3 = getattr(self.args, "ds3_gather_for_generation", True)
         with unwrap_model_for_generation(
             self.model_wrapped,
             self.accelerator,
@@ -624,33 +659,27 @@ class ERLTrainer(GRPOTrainer):
             per_token_loss = per_token_loss + beta * per_token_kl
 
         mask = completion_mask
-        mode = "train" if model.training else "eval"
-        _gas = getattr(self, "current_gradient_accumulation_steps", None) or self.args.gradient_accumulation_steps
-        normalizer = _gas if mode == "train" else 1.0
-        _accum = (
-            getattr(self, "current_gradient_accumulation_steps", None)
-            or self.args.gradient_accumulation_steps
-        )
-        normalizer = _accum if mode == "train" else 1.0
+        # NOTE: do not divide by gradient_accumulation_steps here.
+        # HF Trainer's training_step performs that division automatically on
+        # the value returned by ``compute_loss``. Pre-dividing produces a 1/N²
+        # scale and effectively suppresses the ERL gradient.
 
         if loss_type in ("grpo", "sapo", "dapo"):
             loss = (
                 (per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
-            ).mean() / normalizer
+            ).mean()
         elif loss_type == "bnpo":
-            loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0) / normalizer
+            loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0)
         elif loss_type == "dr_grpo":
-            loss = (
-                (per_token_loss * mask).sum()
-                / (per_token_loss.size(0) * self.max_completion_length)
-                / normalizer
+            loss = (per_token_loss * mask).sum() / (
+                per_token_loss.size(0) * self.max_completion_length
             )
         elif loss_type == "luspo":
-            loss = (per_token_loss * mask.sum(1, keepdim=True)).mean() / normalizer
+            loss = (per_token_loss * mask.sum(1, keepdim=True)).mean()
         else:
             loss = (
                 (per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
-            ).mean() / normalizer
+            ).mean()
 
         return loss
 
@@ -811,23 +840,21 @@ class ERLTrainer(GRPOTrainer):
                 f"  Total memory size: {mem_size}"
             )
 
-        # ── Phase 6: Re-normalise advantages with y1 rewards ─────────────────
-        combined_rewards = y1_rewards.clone()
-        mean_grouped = combined_rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped = combined_rewards.view(-1, self.num_generations).std(dim=1)
-        mean_grouped = mean_grouped.repeat_interleave(self.num_generations, dim=0)
-        std_grouped = std_grouped.repeat_interleave(self.num_generations, dim=0)
-        new_advantages = combined_rewards - mean_grouped
-        _scale = getattr(self, "scale_rewards", "group")
-        if _scale is True or (isinstance(_scale, str) and _scale != "none"):
-            new_advantages = new_advantages / (std_grouped + 1e-4)
-        y1_result["advantages"] = new_advantages
+        # ── Phase 6: Y1 advantages ───────────────────────────────────────────
+        # The parent's ``_generate_and_score_completions`` has already written
+        # group-normalised advantages into ``y1_result["advantages"]`` honouring
+        # ``scale_rewards`` and the per-reward-function weights. We deliberately
+        # do not recompute them here — re-deriving from cached ``y1_rewards``
+        # silently drifts when ``scale_rewards != "group"`` and bypasses the
+        # parent's per-func weighting.
 
         if _debug:
-            adv_sample = [round(a, 3) for a in new_advantages[:4].tolist()]
+            adv_sample = [
+                round(a, 3) for a in y1_result["advantages"][:4].tolist()
+            ]
             logger.debug(
                 f"[ERL Step {_step}] Phase 6 — Advantages\n"
-                f"  Y1 advantages (first 4): {adv_sample}"
+                f"  Y1 advantages (first 4, from parent): {adv_sample}"
             )
 
         # ── Phase 6b: Store Δ + y2 RL data ───────────────────────────────────
@@ -869,8 +896,18 @@ class ERLTrainer(GRPOTrainer):
     # ------------------------------------------------------------------
 
     def _compute_internalization_loss(self, model: nn.Module) -> torch.Tensor:
-        """SFT cross-entropy on ``(original_prompt → y2)`` pairs, normalised
-        by gradient accumulation steps to match the GRPO loss scale."""
+        """SFT cross-entropy on ``(original_prompt → y2)`` pairs.
+
+        The prompt and the y2 completion are tokenised *separately* and then
+        concatenated at the token level — tokenising ``prompt + y2`` as one
+        string is unsafe because BPE/SentencePiece merges across the boundary
+        can produce a different token at the join, silently shifting which
+        positions are masked vs supervised.
+
+        We do not divide by ``gradient_accumulation_steps`` here: HF Trainer's
+        ``training_step`` performs that division on the value returned by
+        ``compute_loss``. Pre-dividing produces a 1/N² scale.
+        """
         pairs = self._internalization_pairs
         if not pairs:
             return torch.tensor(0.0, device=self.accelerator.device)
@@ -884,18 +921,23 @@ class ERLTrainer(GRPOTrainer):
         all_attention_masks: list[torch.Tensor] = []
 
         for prompt, y2_text in pairs:
-            prompt_text = _prompt_to_text(prompt, tokenizer)
+            # Keep the assistant generation header on the prompt side so the
+            # boundary is well defined and y2 starts where the model would
+            # actually produce its response at inference time.
+            prompt_text = _prompt_to_text(
+                prompt, tokenizer, add_generation_prompt=True
+            )
 
-            full_ids: torch.Tensor = tokenizer(
-                prompt_text + y2_text, add_special_tokens=False, return_tensors="pt"
+            prompt_ids: torch.Tensor = tokenizer(
+                prompt_text, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"][0]
+            y2_ids: torch.Tensor = tokenizer(
+                y2_text, add_special_tokens=False, return_tensors="pt"
             )["input_ids"][0]
 
-            prompt_only_len: int = tokenizer(
-                prompt_text, add_special_tokens=False, return_tensors="pt"
-            )["input_ids"].shape[1]
-
+            full_ids = torch.cat([prompt_ids, y2_ids], dim=0)
             labels = full_ids.clone()
-            labels[:prompt_only_len] = -100
+            labels[: prompt_ids.shape[0]] = -100  # mask prompt tokens
 
             all_input_ids.append(full_ids)
             all_labels.append(labels)
@@ -918,16 +960,7 @@ class ERLTrainer(GRPOTrainer):
             attention_mask=batch_attention_mask,
             labels=batch_labels,
         )
-        loss = outputs.loss
-        if model.training:
-            _gas = getattr(self, "current_gradient_accumulation_steps", None) or self.args.gradient_accumulation_steps
-            loss = loss / _gas
-            _accum = (
-                getattr(self, "current_gradient_accumulation_steps", None)
-                or self.args.gradient_accumulation_steps
-            )
-            loss = loss / _accum
-        return loss
+        return outputs.loss
 
     def compute_loss(
         self,

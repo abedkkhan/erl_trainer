@@ -127,9 +127,9 @@ All `GRPOConfig` options are inherited. ERL adds:
 
 ### TRL version compatibility
 
-`erl-trainer 0.4.x` targets **TRL 0.22.x** exclusively.
+`erl-trainer 0.4.x` targets **TRL 0.17.x** (see `pyproject.toml` for the exact pin).
 
-In TRL 0.22.x the monolithic `_generate_and_score_completions` method handles everything — tokenisation, generation, EOS masking, log-probability computation, reward evaluation, advantage normalisation, and metrics logging — and returns a plain dict consumed by `_compute_loss`.
+In TRL 0.17.x the monolithic `_generate_and_score_completions` method handles everything — tokenisation, generation, EOS masking, log-probability computation, reward evaluation, advantage normalisation, and metrics logging — and returns a plain dict consumed by `_compute_loss`.
 
 `ERLTrainer` overrides `_generate_and_score_completions` and delegates Phase 1 (first attempt) entirely to the parent. ERL phases 2–7 run on top of the parent's output. The returned dict has the same keys as the parent's method so `_compute_loss` works without modification.
 
@@ -155,7 +155,7 @@ This implementation follows **Algorithm 2** from the ERL paper:
 
 | erl-trainer | TRL | transformers |
 |-------------|-----|--------------|
-| 0.4.x | 0.22.x | ≥ 4.50.0 |
+| 0.4.x | 0.17.x | ≥ 4.50.0 |
 | 0.3.x | 0.17.x | ≥ 4.50.0 |
 | 0.2.x | 0.17.x | ≥ 4.50.0 |
 | 0.1.x | 0.15.x | ≥ 4.50.0 |
@@ -179,13 +179,17 @@ If you use `erl-trainer` in your research, please cite the original ERL paper an
 
 **ERL paper** — the algorithm this package implements:
 
+<!--
+TODO: confirm the correct arXiv ID before tagging the next release.
+The previous "2602.13949" is not a valid arXiv identifier (year 2602).
+-->
+
 ```bibtex
-@article{shi2026erl,
+@article{shi_erl,
   title   = {Experiential Reinforcement Learning},
   author  = {Shi, Taiwei and Chen, Sihao and Jiang, Bowen and Song, Linxin and Yang, Longqi and Zhao, Jieyu},
-  journal = {arXiv preprint arXiv:2602.13949},
-  year    = {2026},
-  url     = {https://arxiv.org/abs/2602.13949}
+  journal = {arXiv preprint},
+  note    = {arXiv ID to be filled in}
 }
 ```
 
