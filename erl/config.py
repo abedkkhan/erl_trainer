@@ -34,6 +34,20 @@ class ERLConfig(GRPOConfig):
         default=1.0,
         metadata={"help": "Gating threshold τ. Samples with r1 >= τ skip reflection."},
     )
+    memory_add_threshold: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Threshold for writing a reflection into memory after retry. "
+                "Per the ERL paper (Alg. 2 line 18), memory is written when "
+                "r2 > τ — but with continuous rewards normalised to [0, 1] and "
+                "τ = 1.0 (the default for retry-gating), this gate would never "
+                "fire and the memory feature would be silently dead. "
+                "Set this separately when reward_threshold sits at the top of "
+                "the reward range. Falls back to reward_threshold when None."
+            )
+        },
+    )
     memory_size: int = field(
         default=50,
         metadata={"help": "Maximum number of reflections stored in cross-episode memory."},
