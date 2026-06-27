@@ -219,6 +219,45 @@ class ERLTrainer(GRPOTrainer):
     # Prompt construction helpers
     # ------------------------------------------------------------------
 
+    def _strip_chat_markers(self, text: str) -> str:
+        """Remove chat-control tokens from a prompt before substitution into the
+        reflection / retry template.
+
+        When the caller's dataset emits pre-templated prompts (e.g. with Qwen3.5's
+        `<|im_start|>system\\n...<|im_end|>` markers so that y1 generation can
+        access a system prompt), the templated string flows through
+        ``prompts_raw[i]`` into ``_build_reflection_prompt``. Naively substituting
+        it leaves chat-control tokens *inside* the reflection user turn — the
+        model then sees nested role tokens like:
+            <|im_start|>user
+            ## Brief
+            <|im_start|>system
+            ...
+            <|im_start|>assistant
+            (← the brief's leftover assistant tag)
+            ...
+            <|im_start|>assistant   (← the reflection's actual assistant tag)
+        which breaks the role boundary the model was trained on and frequently
+        causes empty or degenerate completions in batched generation.
+
+        We strip the common chat markers from the substituted text. The brief
+        content remains intact; only role wrappers are removed.
+        """
+        markers = (
+            "<|im_start|>system\n", "<|im_start|>user\n", "<|im_start|>assistant\n",
+            "<|im_start|>system", "<|im_start|>user", "<|im_start|>assistant",
+            "<|im_end|>", "<|im_start|>",
+            "<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>",
+            "<|eot_id|>",
+            "<start_of_turn>", "<end_of_turn>",
+            "<think>\n\n</think>\n\n",  # Qwen3.5 enable_thinking=False empty block
+            "<think>", "</think>",
+        )
+        out = text
+        for m in markers:
+            out = out.replace(m, "")
+        return out.strip()
+
     def _build_reflection_prompt(
         self,
         prompt: str,
@@ -230,24 +269,32 @@ class ERLTrainer(GRPOTrainer):
         """Format the reflection prompt using the configured template.
 
         Uses ``_format_safe`` so braces in user content (LaTeX, JSON) cannot
-        break the template substitution.
+        break the template substitution. Also strips chat-control tokens from
+        ``prompt`` and ``attempt`` so that pre-templated dataset prompts do not
+        embed nested role wrappers inside the reflection user turn (which would
+        confuse role boundaries and cause empty completions).
         """
         memory_str = "\n\n".join(memory_entries) if memory_entries else "None available."
         return _format_safe(
             self.args.reflection_system_prompt,
-            prompt=prompt,
-            attempt=attempt,
+            prompt=self._strip_chat_markers(prompt),
+            attempt=self._strip_chat_markers(attempt),
             feedback=feedback,
             reward=reward,
             memory=memory_str,
         )
 
     def _build_retry_prompt(self, prompt: str, reflection: str) -> str:
-        """Format the retry prompt using the configured template."""
+        """Format the retry prompt using the configured template.
+
+        Strips chat-control tokens from ``prompt`` and ``reflection`` so that
+        pre-templated text does not embed nested role wrappers inside the retry
+        user turn.
+        """
         return _format_safe(
             self.args.retry_system_prompt,
-            prompt=prompt,
-            reflection=reflection,
+            prompt=self._strip_chat_markers(prompt),
+            reflection=self._strip_chat_markers(reflection),
         )
 
     # ------------------------------------------------------------------
