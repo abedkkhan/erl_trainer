@@ -319,28 +319,46 @@ class ERLTrainer(GRPOTrainer):
         #    ("double-templating"), which destroys the assistant generation
         #    context — the model sees nested user/system tags and produces
         #    garbage. Detect by looking for any known chat marker.
+        #
+        # For cases (1) and (2), pass `enable_thinking=False` if the tokenizer
+        # supports it. Qwen3.5 (and other thinking-capable models) default to
+        # opening a `<think>` block at the assistant turn — the model then
+        # writes its reasoning instead of the requested completion, and the
+        # max_completion_length budget is exhausted before the actual output.
+        # Reflection and retry prompts especially need this off — we want
+        # critique/ad text, not chain-of-thought.
         formatted_texts: list[str] = []
         chat_markers = (
             "<|im_start|>", "<|im_end|>",        # Qwen, ChatML
             "<|begin_of_text|>", "<|start_header_id|>",  # Llama 3
             "<start_of_turn>", "<end_of_turn>",  # Gemma
         )
+
+        def _apply(messages: list[dict]) -> str:
+            try:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                # Older tokenizers without `enable_thinking` parameter
+                return tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+
         for t in prompt_texts:
             if isinstance(t, list):
                 # Case 2: caller passed message list directly
-                formatted_texts.append(
-                    tokenizer.apply_chat_template(
-                        t, tokenize=False, add_generation_prompt=True
-                    )
-                )
+                formatted_texts.append(_apply(t))
             elif isinstance(t, str) and any(m in t for m in chat_markers):
                 # Case 3: already templated, pass through unchanged
                 formatted_texts.append(t)
             else:
                 # Case 1: plain text, wrap and template
-                ex = {"prompt": [{"role": "user", "content": t}]}
                 formatted_texts.append(
-                    maybe_apply_chat_template(ex, tokenizer)["prompt"]
+                    _apply([{"role": "user", "content": t}])
                 )
 
         prompt_inputs = tokenizer(
