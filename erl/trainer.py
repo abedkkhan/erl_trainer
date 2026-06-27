@@ -308,12 +308,40 @@ class ERLTrainer(GRPOTrainer):
         device = self.accelerator.device
         tokenizer = self.processing_class
 
-        chat_inputs = [
-            {"prompt": [{"role": "user", "content": t}]} for t in prompt_texts
-        ]
-        formatted_texts = [
-            maybe_apply_chat_template(ex, tokenizer)["prompt"] for ex in chat_inputs
-        ]
+        # Format each prompt into the string the tokenizer will see. Three cases:
+        #
+        # 1) Plain text (str): wrap as a single user turn and apply chat template.
+        # 2) Conversational (list of {role, content} dicts): apply chat template
+        #    directly — caller has set up system/user roles intentionally.
+        # 3) Pre-templated string (str containing chat-control tokens like
+        #    "<|im_start|>"): DO NOT re-wrap. Re-templating a pre-templated
+        #    string puts the chat control tokens inside another user turn
+        #    ("double-templating"), which destroys the assistant generation
+        #    context — the model sees nested user/system tags and produces
+        #    garbage. Detect by looking for any known chat marker.
+        formatted_texts: list[str] = []
+        chat_markers = (
+            "<|im_start|>", "<|im_end|>",        # Qwen, ChatML
+            "<|begin_of_text|>", "<|start_header_id|>",  # Llama 3
+            "<start_of_turn>", "<end_of_turn>",  # Gemma
+        )
+        for t in prompt_texts:
+            if isinstance(t, list):
+                # Case 2: caller passed message list directly
+                formatted_texts.append(
+                    tokenizer.apply_chat_template(
+                        t, tokenize=False, add_generation_prompt=True
+                    )
+                )
+            elif isinstance(t, str) and any(m in t for m in chat_markers):
+                # Case 3: already templated, pass through unchanged
+                formatted_texts.append(t)
+            else:
+                # Case 1: plain text, wrap and template
+                ex = {"prompt": [{"role": "user", "content": t}]}
+                formatted_texts.append(
+                    maybe_apply_chat_template(ex, tokenizer)["prompt"]
+                )
 
         prompt_inputs = tokenizer(
             text=formatted_texts,
@@ -820,9 +848,19 @@ class ERLTrainer(GRPOTrainer):
             )
 
         # ── Phase 5: Memory update ───────────────────────────────────────────
+        # ERL paper Alg. 2 line 18: memory is written when r2 > τ. With
+        # continuous rewards in [0, 1] and τ at the top of that range, that
+        # gate never fires and the memory feature is silently dead. Use a
+        # separate `memory_add_threshold` when set; otherwise fall back to
+        # the retry threshold (paper-faithful behaviour).
+        mem_thresh = (
+            self.args.memory_add_threshold
+            if self.args.memory_add_threshold is not None
+            else self.args.reward_threshold
+        )
         if self.args.enable_memory and self.memory is not None:
             for j, i in enumerate(gated_indices):
-                if y2_rewards[j].item() > self.args.reward_threshold:
+                if y2_rewards[j].item() > mem_thresh:
                     prompt_str = _prompt_to_text(prompts_raw[i], self.processing_class)
                     self.memory.add(
                         reflection_texts[j], prompt_str, float(y2_rewards[j].item())
@@ -831,7 +869,7 @@ class ERLTrainer(GRPOTrainer):
         if _debug:
             mem_added = sum(
                 1 for j in range(len(gated_indices))
-                if y2_rewards[j].item() > self.args.reward_threshold
+                if y2_rewards[j].item() > mem_thresh
             )
             mem_size = len(self.memory) if self.memory is not None else 0
             logger.debug(
