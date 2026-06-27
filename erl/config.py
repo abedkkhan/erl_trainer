@@ -104,3 +104,23 @@ class ERLConfig(GRPOConfig):
             )
         },
     )
+    reflection_temperature: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Sampling temperature override for the reflection (Phase 3) "
+                "generation pass ONLY. When None, the global generation_config "
+                "temperature is used. Raise above the policy temperature "
+                "(e.g. 0.9-1.1) to fight reflection mode-collapse driven by "
+                "the internalization SFT loop reinforcing one phrasing."
+            )
+        },
+    )
+    reflection_top_p: float | None = field(
+        default=None,
+        metadata={"help": "top_p override for reflection generation. None = use global."},
+    )
+    reflection_top_k: int | None = field(
+        default=None,
+        metadata={"help": "top_k override for reflection generation. None = use global."},
+    )

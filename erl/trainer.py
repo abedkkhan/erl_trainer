@@ -333,6 +333,7 @@ class ERLTrainer(GRPOTrainer):
         prompt_texts: list[str],
         *,
         compute_logps: bool = False,
+        phase: str = "default",
     ) -> tuple:
         """Generate one completion per plain-text prompt string.
 
@@ -427,6 +428,27 @@ class ERLTrainer(GRPOTrainer):
         # generation under DeepSpeed ZeRO-3 because parameters would be sharded
         # across ranks.
         gather_ds3 = getattr(self.args, "ds3_gather_for_generation", True)
+
+        # Per-phase generation config override. Reflection (Phase 3) generation
+        # is prone to mode-collapse driven by the internalization SFT phase
+        # reinforcing whatever phrasing happens to produce y2 > y1 lift early
+        # in training. Higher temperature / top_p at the reflection step breaks
+        # the prior on opening tokens and keeps reflections diverse.
+        gen_config = self.generation_config
+        if phase == "reflection":
+            r_temp = getattr(self.args, "reflection_temperature", None)
+            r_top_p = getattr(self.args, "reflection_top_p", None)
+            r_top_k = getattr(self.args, "reflection_top_k", None)
+            if r_temp is not None or r_top_p is not None or r_top_k is not None:
+                from copy import deepcopy
+                gen_config = deepcopy(self.generation_config)
+                if r_temp is not None:
+                    gen_config.temperature = r_temp
+                if r_top_p is not None:
+                    gen_config.top_p = r_top_p
+                if r_top_k is not None:
+                    gen_config.top_k = r_top_k
+
         with unwrap_model_for_generation(
             self.model_wrapped,
             self.accelerator,
@@ -435,7 +457,7 @@ class ERLTrainer(GRPOTrainer):
             prompt_completion_ids = unwrapped_model.generate(
                 prompt_ids,
                 attention_mask=prompt_mask,
-                generation_config=self.generation_config,
+                generation_config=gen_config,
             )
 
         prompt_length = prompt_ids.size(1)
@@ -868,7 +890,9 @@ class ERLTrainer(GRPOTrainer):
         (
             prompt_ids_d, prompt_mask_d, completion_ids_d, reflection_texts,
             completion_mask_d, old_logps_d, ref_logps_d,
-        ) = self._erl_generate(reflection_prompts, compute_logps=compute_logps)
+        ) = self._erl_generate(
+            reflection_prompts, compute_logps=compute_logps, phase="reflection"
+        )
 
         if _debug:
             logger.debug(
