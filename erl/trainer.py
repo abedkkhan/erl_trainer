@@ -1010,10 +1010,22 @@ class ERLTrainer(GRPOTrainer):
             self._erl_rl_data = None
 
         # ── Phase 7: Store internalization pairs ─────────────────────────────
+        # Paper writes Ldistill = -E[I(r2 > 0) log πθ(y2 | x)] — designed for
+        # BINARY reward where >0 means "succeeded". With continuous reward in
+        # [0, 1] this hardcoded > 0 gate fires on every retry and silently
+        # turns Ldistill into "SFT on every y2", which collapses reflections
+        # (v1 failure mode). When `distill_threshold` is set on the config,
+        # we use that threshold instead; otherwise fall back to the paper's
+        # > 0 rule so binary-reward callers are unaffected.
+        distill_thresh = (
+            self.args.distill_threshold
+            if self.args.distill_threshold is not None
+            else 0.0
+        )
         self._internalization_pairs = []
         if self.args.enable_internalization:
             for j, i in enumerate(gated_indices):
-                if y2_rewards[j].item() > 0:
+                if y2_rewards[j].item() > distill_thresh:
                     self._internalization_pairs.append((prompts_raw[i], y2_texts[j]))
 
         return y1_result

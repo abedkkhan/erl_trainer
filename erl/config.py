@@ -48,6 +48,22 @@ class ERLConfig(GRPOConfig):
             )
         },
     )
+    distill_threshold: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Threshold for including a (prompt → y2) pair in the "
+                "internalization SFT batch. Per the ERL paper, Ldistill uses "
+                "I(r2 > 0) — designed for BINARY reward where >0 means "
+                "succeeded. With continuous reward in [0, 1] every retry has "
+                "r2 > 0 (even bad ones), so distillation degenerates into "
+                "'SFT on every y2' — this was the v1 reflection-collapse "
+                "driver. Set this to a calibrated value (e.g. 0.55) to only "
+                "distill on retries that actually beat the bar. Falls back to "
+                "paper-faithful r2 > 0 when None."
+            )
+        },
+    )
     memory_size: int = field(
         default=50,
         metadata={"help": "Maximum number of reflections stored in cross-episode memory."},
