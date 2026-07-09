@@ -680,18 +680,32 @@ class ERLTrainer(GRPOTrainer):
     # Advantage normalisation for Δ and y2
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _erl_compute_r2_advantages(rewards: torch.Tensor) -> torch.Tensor:
-        """Batch-wide advantage normalisation for Δ and y2 rewards.
+    def _erl_compute_r2_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
+        """Advantage normalisation for Δ and y2 rewards.
 
         Unlike y1 which uses group-wise normalisation (GRPO), Δ and y2 use
         batch-wide normalisation because each gated sample produces exactly one
         Δ and one y2 (group size 1 makes per-group normalisation degenerate).
 
+        Supports two modes via ``args.advantage_type``:
+          - ``"z_score"`` (default, paper-faithful): batch-wide z-scoring.
+            Sensitive to judge quantization noise when reward variance is small.
+          - ``"rank"`` (Xu et al. 2025): rank-based, [-0.5, 0.5] range.
+            Better for creative tasks with discrete/coarse judge outputs
+            because it doesn't amplify tiny reward differences.
+
         Returns all-zeros when ``N <= 1``.
         """
         if rewards.shape[0] <= 1:
             return torch.zeros_like(rewards)
+
+        if getattr(self.args, "advantage_type", "z_score") == "rank":
+            # Xu et al. 2025 — rank-based advantages, robust to judge noise
+            ranks = torch.argsort(torch.argsort(rewards)).float()
+            n = rewards.shape[0]
+            return (ranks - (n - 1) / 2) / n
+
+        # Paper-faithful z-score
         mean = rewards.mean()
         std = rewards.std()
         return (rewards - mean) / (std + 1e-4)

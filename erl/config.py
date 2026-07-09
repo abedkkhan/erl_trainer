@@ -140,3 +140,16 @@ class ERLConfig(GRPOConfig):
         default=None,
         metadata={"help": "top_k override for reflection generation. None = use global."},
     )
+    advantage_type: str = field(
+        default="z_score",
+        metadata={
+            "help": (
+                "Advantage normalization for Δ and y2 rewards. "
+                "'z_score' (default) — paper-faithful batch-wide z-scoring. "
+                "'rank' — rank-based advantages (Xu et al. 2025, 'Rank-based RLHF'). "
+                "Rank-based is more robust to judge quantization noise and preserves "
+                "diversity better for creative tasks; recommended when reward variance "
+                "is small or judges output discrete scores."
+            )
+        },
+    )
